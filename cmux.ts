@@ -34,6 +34,7 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { execSync, execFileSync, spawn } from "node:child_process";
+import { writeFileSync, unlinkSync } from "node:fs";
 import * as path from "node:path";
 
 // ── Config ─────────────────────────────────────────────
@@ -858,8 +859,12 @@ export default function cmuxExtension(pi: ExtensionAPI) {
 
               const paneResult = cmux("new-pane", "--type", "terminal", "--direction", "right");
               const sfMatch = paneResult.match(/surface:\d+/);
+              const pnMatch = paneResult.match(/pane:\d+/);
               surfaceRef = sfMatch ? sfMatch[0] : "";
               if (!surfaceRef) throw new Error(`Failed to create terminal pane in hive workspace`);
+
+              // Resize worker pane to ~1/3 of the workspace
+              if (pnMatch) cmuxSafe("resize-pane", "--pane", pnMatch[0], "-L", "--amount", "40");
 
               // Close the default non-writable surface
               if (defaultSf) cmuxSafe("close-surface", "--surface", defaultSf[0]);
@@ -872,8 +877,13 @@ export default function cmuxExtension(pi: ExtensionAPI) {
               const splitDir = _hiveWorkspaceSurfaceCount % 2 === 0 ? "right" : "down";
               const paneResult = cmux("new-pane", "--type", "terminal", "--direction", splitDir);
               const sfMatch = paneResult.match(/surface:\d+/);
+              const pnMatch = paneResult.match(/pane:\d+/);
               surfaceRef = sfMatch ? sfMatch[0] : "";
               if (!surfaceRef) throw new Error(`Failed to create terminal pane in hive workspace`);
+
+              // Resize worker pane to ~1/3
+              if (pnMatch) cmuxSafe("resize-pane", "--pane", pnMatch[0], "-L", "--amount", "40");
+
               workspaceRef = _hiveWorkspaceRef;
               _hiveWorkspaceSurfaceCount++;
             }
@@ -894,19 +904,20 @@ export default function cmuxExtension(pi: ExtensionAPI) {
             }
           }
 
-          // 2. Set cwd for the new surface
-          cmux("send", "--surface", surfaceRef, `cd ${cwd}`);
-          cmux("send-key", "--surface", surfaceRef, "Enter");
+          // 2. Write prompt to temp file to avoid shell escaping nightmares
+          const promptFile = path.join(cwd, `.pi-worker-${agentId}.md`);
+          writeFileSync(promptFile, params.prompt);
 
-          // 3. Build and send the pi command
-          const piArgs = ["pi", "--model", model, "--print"];
+          // 3. Build the pi command with @file reference
+          const piArgs = ["pi", "--model", model];
           if (params.skills?.length) {
             for (const skill of params.skills) piArgs.push("--skill", skill);
           }
-          piArgs.push(JSON.stringify(params.prompt));
+          piArgs.push(`@${promptFile}`);
 
-          const envPrefix = `PI_CMUX_ROLE=worker`;
-          cmux("send", "--surface", surfaceRef, `${envPrefix} ${piArgs.join(" ")}`);
+          // 4. Send cd + pi as one chained command, clean up prompt file after
+          const fullCmd = `cd ${cwd} && PI_CMUX_ROLE=worker ${piArgs.join(" ")}; rm -f ${promptFile}`;
+          cmux("send", "--surface", surfaceRef, fullCmd);
           cmux("send-key", "--surface", surfaceRef, "Enter");
 
           // 4. Register in fleet
@@ -921,6 +932,9 @@ export default function cmuxExtension(pi: ExtensionAPI) {
             spawnedAt: Date.now(),
           };
           fleet.set(agentId, agent);
+
+          // Start completion detection if not already running
+          startCompletionPolling();
 
           // 5. Switch back to orchestrator workspace
           if (orchestratorWorkspace && orchestratorWorkspace !== workspaceRef) {
@@ -1176,6 +1190,56 @@ export default function cmuxExtension(pi: ExtensionAPI) {
         return new Text(`${preview}${suffix}`, 0, 0);
       },
     });
+
+    // ── Completion detection polling ──────────────────────────
+    //
+    // Polls each agent's terminal every 5s. When a shell prompt is visible
+    // (❯ or $), pi has exited → mark agent idle and notify the orchestrator.
+
+    let _completionPollTimer: ReturnType<typeof setInterval> | null = null;
+    const COMPLETION_POLL_MS = 5000;
+    const SPAWN_GRACE_MS = 15000; // let pi boot before checking
+
+    // Shell prompt visible = pi exited, agent returned to shell
+    const IDLE_PROMPT_RE = /(?:^❯|\$\s*$)/m;
+
+    function startCompletionPolling(): void {
+      if (_completionPollTimer) return;
+      _completionPollTimer = setInterval(() => {
+        if (fleet.size === 0) {
+          stopCompletionPolling();
+          return;
+        }
+
+        for (const [id, agent] of fleet) {
+          if (agent.status === "idle" || agent.status === "completed" || agent.status === "failed") continue;
+          if (Date.now() - agent.spawnedAt < SPAWN_GRACE_MS) continue;
+
+          const screen = cmuxSafe("read-screen", "--surface", agent.surfaceRef, "--lines", "5");
+          if (!screen) continue;
+
+          if (IDLE_PROMPT_RE.test(screen)) {
+            agent.status = "idle";
+            pi.sendMessage(
+              {
+                customType: "agent-completion",
+                content: `🐝 Agent ${id} has finished and is idle.\nPrompt: ${agent.prompt}\nSurface: ${agent.surfaceRef}`,
+                display: true,
+              },
+              { triggerTurn: true },
+            );
+            cmuxSafe("log", "--level", "info", "--source", "fleet", "--", `Agent ${id} idle`);
+          }
+        }
+      }, COMPLETION_POLL_MS);
+    }
+
+    function stopCompletionPolling(): void {
+      if (_completionPollTimer) {
+        clearInterval(_completionPollTimer);
+        _completionPollTimer = null;
+      }
+    }
 
   } // end !IS_WORKER
 
