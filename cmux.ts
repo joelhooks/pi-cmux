@@ -1134,8 +1134,12 @@ export default function cmuxExtension(pi: ExtensionAPI) {
     const COMPLETION_POLL_MS = 5000;
     const SPAWN_GRACE_MS = 15000; // let pi boot before checking
 
-    // Shell prompt visible = pi exited, agent returned to shell
-    const IDLE_PROMPT_RE = /(?:^❯|\$\s*$)/m;
+    // Detect agent idle:
+    // Pi footer visible (cost info) WITHOUT a spinner = agent finished, pi at input prompt
+    // Shell prompt (❯ or $) = pi exited back to shell
+    const HAS_PI_FOOTER = /\$[0-9]+\.[0-9]+/;           // $0.175 in footer
+    const IS_WORKING = /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s|Working|Thinking/;  // spinner or status
+    const IDLE_SHELL_RE = /^[❯$]\s*$/m;                  // shell prompt alone on line
 
     function startCompletionPolling(): void {
       if (_completionPollTimer) return;
@@ -1152,7 +1156,8 @@ export default function cmuxExtension(pi: ExtensionAPI) {
           const screen = cmuxSafe("read-screen", "--surface", agent.surfaceRef, "--lines", "5");
           if (!screen) continue;
 
-          if (IDLE_PROMPT_RE.test(screen)) {
+          const piIdle = HAS_PI_FOOTER.test(screen) && !IS_WORKING.test(screen);
+          if (piIdle || IDLE_SHELL_RE.test(screen)) {
             agent.status = "idle";
             pi.sendMessage(
               {
