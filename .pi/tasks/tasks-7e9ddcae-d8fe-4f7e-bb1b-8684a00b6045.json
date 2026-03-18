@@ -1,0 +1,99 @@
+{
+  "nextId": 7,
+  "tasks": [
+    {
+      "id": "1",
+      "subject": "Scaffold the-hive course project via gremlin CLI",
+      "description": "Use `gremlin course init` to scaffold course-the-hive-multi-agent-orchestration in /Users/joel/Code/badass-courses/. Slug: the-hive-multi-agent-orchestration, title: \"The Hive: Multi-Agent Orchestration\"",
+      "status": "completed",
+      "activeForm": "Scaffolding course project",
+      "metadata": {},
+      "blocks": [
+        "2",
+        "3",
+        "4",
+        "5",
+        "6"
+      ],
+      "blockedBy": [],
+      "createdAt": 1773867912771,
+      "updatedAt": 1773867982712
+    },
+    {
+      "id": "2",
+      "subject": "Wire gremlin-course-authoring infra (symlinks)",
+      "description": "Symlink extensions/gremlin, skills/course-building, skills/course-architect, skills/course-outliner, skills/lesson-writer, skills/lesson-evaluator, skills/pdf-brain from gremlin-course-authoring into the course project's .pi/ directory",
+      "status": "completed",
+      "activeForm": "Wiring authoring infrastructure",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [
+        "1"
+      ],
+      "createdAt": 1773867917604,
+      "updatedAt": 1773868010352
+    },
+    {
+      "id": "3",
+      "subject": "Drop gist spec files into research/",
+      "description": "Save all 8 gist files (00-OVERVIEW through 07-PATTERNS-STOLEN) into research/ as the raw source material for the course",
+      "status": "completed",
+      "activeForm": "Saving gist research material",
+      "metadata": {},
+      "blocks": [
+        "4"
+      ],
+      "blockedBy": [
+        "1"
+      ],
+      "createdAt": 1773867921954,
+      "updatedAt": 1773868031646
+    },
+    {
+      "id": "4",
+      "subject": "Seed lat.md knowledge graph from gist content",
+      "description": "Populate lat.md/ with: source-material.md (gist summary + links), architecture.md (the 5-layer stack from 01-ARCHITECTURE), course-design.md (professional task, essential questions, outline stubs derived from the spec), build-log.md (initial entry)",
+      "status": "completed",
+      "activeForm": "Seeding knowledge graph",
+      "metadata": {},
+      "blocks": [
+        "5"
+      ],
+      "blockedBy": [
+        "1",
+        "3"
+      ],
+      "createdAt": 1773867927369,
+      "updatedAt": 1773868152968
+    },
+    {
+      "id": "5",
+      "subject": "Write course ID.md and AGENTS.md",
+      "description": "Create the instructional design doc (ID.md) with essential questions, professional task, design principles, and causal chain — following the pattern from course-the-claw. Write AGENTS.md with project-specific workflow instructions.",
+      "status": "completed",
+      "activeForm": "Writing instructional design docs",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [
+        "1",
+        "4"
+      ],
+      "createdAt": 1773867933487,
+      "updatedAt": 1773868334948
+    },
+    {
+      "id": "6",
+      "subject": "Set up explorations workspace and first exploration stub",
+      "description": "Create explorations/ as a bun workspace monorepo (matching the-claw pattern). Create first exploration stub: 2026-03-18-spawn-pi-visible-workers for the highest-leverage piece of the spec.",
+      "status": "completed",
+      "activeForm": "Setting up explorations workspace",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [
+        "1"
+      ],
+      "createdAt": 1773867939190,
+      "updatedAt": 1773868429197
+    }
+  ]
+}
