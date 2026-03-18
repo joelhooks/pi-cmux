@@ -127,10 +127,17 @@ function playPeonPing(event: "stop" | "notification"): void {
 
 function setStatus(status: { value: string; icon: string; color: string }): void {
   cmuxSafe("set-status", STATUS_KEY, status.value, "--icon", status.icon, "--color", status.color);
+  clearBuiltinStatus();
 }
 
 function clearStatus(): void {
   cmuxSafe("clear-status", STATUS_KEY);
+  // cmux has a built-in claude_code status key that conflicts with ours — always clear it
+  cmuxSafe("clear-status", "claude_code");
+}
+
+function clearBuiltinStatus(): void {
+  cmuxSafe("clear-status", "claude_code");
 }
 
 // ── Focus detection ────────────────────────────────────
