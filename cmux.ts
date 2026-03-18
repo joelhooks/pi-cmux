@@ -410,10 +410,15 @@ export default function cmuxExtension(pi: ExtensionAPI) {
     }
   });
 
+  // ── Lifecycle: user types → instantly clear attention state ──
+  pi.on("input", async () => {
+    setStatus(STATUS_IDLE);
+    cmuxSafe("clear-notifications");
+    cmuxSafe("claude-hook", "prompt-submit");
+  });
+
   // ── Lifecycle: first prompt → auto-name session ──
   pi.on("before_agent_start", async (event, ctx) => {
-    // Tell cmux the user is active — clears any pane attention indicator/flash
-    cmuxSafe("claude-hook", "prompt-submit");
     // Name the session from the first user prompt
     if (!_hasNamedSession && event.prompt) {
       _hasNamedSession = true;
