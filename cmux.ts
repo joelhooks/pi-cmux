@@ -68,8 +68,6 @@ interface AgentInfo {
 
 const fleet = new Map<string, AgentInfo>();
 const MAX_AGENTS = parseInt(process.env.PI_CMUX_MAX_AGENTS || "5");
-let _hiveWorkspaceRef: string | null = null;
-let _hiveWorkspaceSurfaceCount = 0;
 
 // ── cmux CLI wrapper ───────────────────────────────────
 
@@ -800,10 +798,9 @@ export default function cmuxExtension(pi: ExtensionAPI) {
         cwd: Type.Optional(Type.String({ description: "Working directory (default: current)" })),
         model: Type.Optional(Type.String({ description: "Model to use (default: anthropic/claude-opus-4-6)" })),
         direction: Type.Optional(Type.Union([
-          Type.Literal("workspace"),
           Type.Literal("right"),
           Type.Literal("down"),
-        ], { description: "Where to place the agent (default: new workspace)" })),
+        ], { description: "Split direction for the worker pane (default: right)" })),
         skills: Type.Optional(Type.Array(Type.String(), {
           description: "Skill names to load (e.g. ['next-best-practices'])",
         })),
@@ -820,79 +817,26 @@ export default function cmuxExtension(pi: ExtensionAPI) {
         const agentId = Math.random().toString(36).slice(2, 10);
         const cwd = params.cwd || process.cwd();
         const model = params.model || "anthropic/claude-opus-4-6";
-        const direction = params.direction || "workspace";
-
-        // Remember where we are so we can switch back
-        let orchestratorWorkspace: string | null = null;
-        try {
-          const id = cmux("identify");
-          const info = JSON.parse(id);
-          orchestratorWorkspace = info.caller?.workspace_ref || null;
-        } catch {}
+        const direction = params.direction || "right";
 
         try {
           // 1. Create the surface
           let surfaceRef: string;
           let workspaceRef: string;
 
-          if (direction === "workspace") {
-            // First worker: create a dedicated "hive" workspace
-            // Subsequent workers: split inside the hive workspace
-            if (!_hiveWorkspaceRef) {
-              // Create the hive workspace
-              const result = cmux("new-workspace", "--cwd", cwd);
-              const wsMatch = result.match(/workspace:\d+/);
-              _hiveWorkspaceRef = wsMatch ? wsMatch[0] : null;
-              if (!_hiveWorkspaceRef) throw new Error(`Failed to parse workspace ref from: ${result}`);
-
-              // Name it (safe — we just created it)
-              cmuxSafe("rename-workspace", "--workspace", _hiveWorkspaceRef, "🐝 hive");
-
-              // Select the hive workspace so new-pane creates inside it
-              // (passing --workspace to new-pane doesn't work for CLI-created workspaces)
-              cmux("select-workspace", "--workspace", _hiveWorkspaceRef);
-
-              // The default surface from new-workspace isn't a writable terminal.
-              // Create a real terminal pane in the hive, then close the default.
-              const defaultSurfaces = cmux("list-pane-surfaces", "--workspace", _hiveWorkspaceRef);
-              const defaultSf = defaultSurfaces.match(/surface:\d+/);
-
-              const paneResult = cmux("new-pane", "--type", "terminal", "--direction", "right");
-              const sfMatch = paneResult.match(/surface:\d+/);
-              const pnMatch = paneResult.match(/pane:\d+/);
-              surfaceRef = sfMatch ? sfMatch[0] : "";
-              if (!surfaceRef) throw new Error(`Failed to create terminal pane in hive workspace`);
-
-              // Resize worker pane to ~1/3 of the workspace
-              if (pnMatch) cmuxSafe("resize-pane", "--pane", pnMatch[0], "-L", "--amount", "40");
-
-              // Close the default non-writable surface
-              if (defaultSf) cmuxSafe("close-surface", "--surface", defaultSf[0]);
-
-              workspaceRef = _hiveWorkspaceRef;
-              _hiveWorkspaceSurfaceCount = 1;
-            } else {
-              // Select hive workspace, then add a new terminal pane
-              cmux("select-workspace", "--workspace", _hiveWorkspaceRef);
-              const splitDir = _hiveWorkspaceSurfaceCount % 2 === 0 ? "right" : "down";
-              const paneResult = cmux("new-pane", "--type", "terminal", "--direction", splitDir);
-              const sfMatch = paneResult.match(/surface:\d+/);
-              const pnMatch = paneResult.match(/pane:\d+/);
-              surfaceRef = sfMatch ? sfMatch[0] : "";
-              if (!surfaceRef) throw new Error(`Failed to create terminal pane in hive workspace`);
-
-              // Resize worker pane to ~1/3
-              if (pnMatch) cmuxSafe("resize-pane", "--pane", pnMatch[0], "-L", "--amount", "40");
-
-              workspaceRef = _hiveWorkspaceRef;
-              _hiveWorkspaceSurfaceCount++;
-            }
-          } else {
-            // Explicit split direction in current workspace
-            const result = cmux("new-split", direction);
-            const sfMatch = result.match(/surface:\d+/);
+          {
+            // Split a new terminal pane in the current workspace
+            const splitDir = direction;
+            const paneResult = cmux("new-pane", "--type", "terminal", "--direction", splitDir);
+            const sfMatch = paneResult.match(/surface:\d+/);
+            const pnMatch = paneResult.match(/pane:\d+/);
             surfaceRef = sfMatch ? sfMatch[0] : "";
-            if (!surfaceRef) throw new Error(`Failed to parse surface ref from split: ${result}`);
+            if (!surfaceRef) throw new Error(`Failed to create terminal pane: ${paneResult}`);
+
+            // Resize worker pane to ~1/3
+            if (pnMatch) cmuxSafe("resize-pane", "--pane", pnMatch[0], "-L", "--amount", "40");
+
+            // Get current workspace ref
             const identify = cmuxSafe("identify");
             if (identify) {
               try {
@@ -936,12 +880,7 @@ export default function cmuxExtension(pi: ExtensionAPI) {
           // Start completion detection if not already running
           startCompletionPolling();
 
-          // 5. Switch back to orchestrator workspace
-          if (orchestratorWorkspace && orchestratorWorkspace !== workspaceRef) {
-            cmuxSafe("select-workspace", "--workspace", orchestratorWorkspace);
-          }
-
-          // 6. Update sidebar with fleet count
+          // 5. Update sidebar with fleet count
           cmuxSafe("set-status", "fleet",
             `${fleet.size} agent${fleet.size > 1 ? "s" : ""}`,
             "--icon", "person.3.fill", "--color", "#4C8DFF");
@@ -1115,12 +1054,7 @@ export default function cmuxExtension(pi: ExtensionAPI) {
               "--icon", "person.3.fill", "--color", "#4C8DFF");
           } else {
             cmuxSafe("clear-status", "fleet");
-            // Close the hive workspace when last agent is killed
-            if (_hiveWorkspaceRef && params.close_workspace) {
-              cmuxSafe("close-workspace", "--workspace", _hiveWorkspaceRef);
-              _hiveWorkspaceRef = null;
-              _hiveWorkspaceSurfaceCount = 0;
-            }
+
           }
 
           return { content: [{ type: "text", text: `Killed agent ${params.agent_id}` }] };
@@ -1256,11 +1190,5 @@ export default function cmuxExtension(pi: ExtensionAPI) {
     }
     fleet.clear();
     cmuxSafe("clear-status", "fleet");
-    // Close the hive workspace
-    if (_hiveWorkspaceRef) {
-      cmuxSafe("close-workspace", "--workspace", _hiveWorkspaceRef);
-      _hiveWorkspaceRef = null;
-      _hiveWorkspaceSurfaceCount = 0;
-    }
   });
 }
