@@ -210,6 +210,63 @@ Bad names: 'general chat', 'coding session', 'help request', 'project work'`,
 
 let _pendingSessionName: string | null = null;
 let _hasNamedSession = false;
+let _turnCount = 0;
+const RENAME_INTERVAL_TURNS = 8;
+
+// ── Session rename at inflection points ────────────────
+
+function reevaluateSessionName(context: string, currentName: string | undefined, cwd: string): void {
+  const dirName = path.basename(cwd);
+  const input = `Project directory: ${dirName}\nCurrent session name: ${currentName || "(unnamed)"}\n\nRecent work:\n${context.slice(0, 600)}`;
+
+  try {
+    const child = spawn("pi", [
+      "-p",
+      "--model", NAMING_MODEL,
+      "--no-session",
+      "--no-extensions",
+      "--no-tools",
+      "--no-skills",
+      "--no-prompt-templates",
+      "--system-prompt",
+      `You are a session renamer. Given a project directory, the current session name, and a summary of recent work, decide if the session name should change.
+
+Reply with ONLY the new name (2-4 words) or reply with exactly KEEP if the current name still fits.
+
+KEEP when:
+- The work is still on the same topic as the current name
+- The name is already a good description of what's happening
+- The shift is minor (same feature, just a different subtask)
+
+RENAME when:
+- The work has clearly shifted to a different topic or feature
+- The current name no longer describes what's actually happening
+- The session started unnamed and now has clear direction
+
+Good names: 'cmux sidebar integration', 'auth refactor', 'deploy pipeline fix'
+No quotes, no explanation, no punctuation. Just the name or KEEP.`,
+    ], {
+      stdio: ["pipe", "pipe", "ignore"],
+      timeout: 15000,
+      env: { ...process.env, [CMUX_CHILD_ENV]: "1" },
+    });
+
+    let output = "";
+    child.stdout?.on("data", (chunk: Buffer) => {
+      output += chunk.toString();
+    });
+
+    child.stdin?.write(input);
+    child.stdin?.end();
+
+    child.on("close", () => {
+      const name = output.trim().slice(0, 60);
+      if (name && name.length > 1 && name.toUpperCase() !== "KEEP") {
+        _pendingSessionName = name;
+      }
+    });
+  } catch {}
+}
 
 // ── Turn summary for sidebar ───────────────────────────
 
@@ -343,6 +400,7 @@ export default function cmuxExtension(pi: ExtensionAPI) {
   // ── Lifecycle: session start — clean slate ──
   pi.on("session_start", async (_event, ctx) => {
     _pendingSessionName = null;
+    _turnCount = 0;
     const existingName = pi.getSessionName();
     _hasNamedSession = Boolean(existingName);
     // Clear stale state from previous sessions
@@ -396,6 +454,7 @@ export default function cmuxExtension(pi: ExtensionAPI) {
   // ── Lifecycle: agent done → idle + summary, peon-ping ──
   pi.on("agent_end", async (event, ctx) => {
     stopHeartbeat();
+    _turnCount++;
     // Set needs-input immediately (summary will overwrite async, keeping bell icon)
     setStatus(STATUS_NEEDS_INPUT);
 
@@ -418,6 +477,11 @@ export default function cmuxExtension(pi: ExtensionAPI) {
     // Workers skip this — it spawns a child pi process
     if (!IS_WORKER) {
       generateTurnSummary(lastAssistantText, ctx.cwd);
+
+      // Re-evaluate session name every N turns
+      if (_turnCount % RENAME_INTERVAL_TURNS === 0 && lastAssistantText) {
+        reevaluateSessionName(lastAssistantText, pi.getSessionName(), ctx.cwd);
+      }
     }
 
     // Only notify + mark-unread if the workspace is NOT focused
@@ -430,11 +494,21 @@ export default function cmuxExtension(pi: ExtensionAPI) {
     }
   });
 
+  // ── Lifecycle: compaction — natural inflection point for rename ──
+  pi.on("session_compact", async (event, ctx) => {
+    if (IS_WORKER) return;
+    const summary = (event as any).compactionEntry?.summary;
+    if (summary) {
+      reevaluateSessionName(summary, pi.getSessionName(), ctx.cwd);
+    }
+  });
+
   // ── Lifecycle: session shutdown ──
   pi.on("session_shutdown", async () => {
     stopHeartbeat();
     _pendingSessionName = null;
     _hasNamedSession = false;
+    _turnCount = 0;
     clearStatus();
     cmuxSafe("clear-status", SESSION_NAME_KEY);
     cmuxSafe("clear-notifications");
