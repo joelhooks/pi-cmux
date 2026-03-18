@@ -170,7 +170,21 @@ function generateSessionName(prompt: string, cwd: string): void {
       "--no-skills",
       "--no-prompt-templates",
       "--system-prompt",
-      "You are a session namer. Given a project directory and first user prompt, reply with ONLY a short 2-4 word session name that captures what the user is working on. No quotes, no explanation, no punctuation. Examples: 'cmux sidebar integration', 'auth refactor', 'deploy pipeline fix'",
+      `You are a session namer. Given a project directory and first user prompt, decide whether this session deserves a name.
+
+ONLY name sessions where the user is doing specific, identifiable work. Reply with ONLY the name (2-4 words, no quotes, no explanation, no punctuation) or reply with exactly SKIP if the session doesn't warrant a name.
+
+SKIP when:
+- The prompt is vague, conversational, or exploratory ("hey", "help me with something", "what do you think")
+- The prompt is a single trivial question or greeting
+- You can't tell what the actual work is
+
+NAME when:
+- The prompt describes a clear task, feature, bug, or project
+- The work is specific enough to distinguish from other sessions
+
+Good names: 'cmux sidebar integration', 'auth refactor', 'deploy pipeline fix', 'test suite cleanup'
+Bad names: 'general chat', 'coding session', 'help request', 'project work'`,
     ], {
       stdio: ["pipe", "pipe", "ignore"],
       timeout: 15000,
@@ -187,7 +201,7 @@ function generateSessionName(prompt: string, cwd: string): void {
 
     child.on("close", () => {
       const name = output.trim().slice(0, 60);
-      if (name && name.length > 1) {
+      if (name && name.length > 1 && name.toUpperCase() !== "SKIP") {
         _pendingSessionName = name;
       }
     });
