@@ -414,6 +414,8 @@ export default function cmuxExtension(pi: ExtensionAPI) {
   // ── Lifecycle: first prompt → auto-name session ──
   pi.on("before_agent_start", async (event, ctx) => {
     _lastUserInputAt = Date.now();
+    // Tell cmux the user is active — clears any pane attention indicator/flash
+    cmuxSafe("claude-hook", "prompt-submit");
     // Name the session from the first user prompt
     if (!_hasNamedSession && event.prompt) {
       _hasNamedSession = true;
