@@ -1021,7 +1021,6 @@ export default function cmuxExtension(pi: ExtensionAPI) {
       description: "Stop a spawned agent. Sends Ctrl-C and optionally closes the workspace.",
       parameters: Type.Object({
         agent_id: Type.String({ description: "Agent ID from spawn_pi" }),
-        close_workspace: Type.Optional(Type.Boolean({ description: "Also close the workspace (default: false)" })),
       }),
 
       async execute(_id, params) {
@@ -1030,19 +1029,15 @@ export default function cmuxExtension(pi: ExtensionAPI) {
           return { content: [{ type: "text", text: `Agent ${params.agent_id} not found.` }], isError: true };
         }
         try {
-          // Send Ctrl-C to interrupt
+          // Send Ctrl-C to interrupt, then close the surface
           cmuxSafe("send-key", "--surface", agent.surfaceRef, "C-c");
-          // Give it a moment, then send exit
           setTimeout(() => {
             cmuxSafe("send", "--surface", agent.surfaceRef, "exit");
             cmuxSafe("send-key", "--surface", agent.surfaceRef, "Enter");
-          }, 1000);
-
-          if (params.close_workspace && agent.workspaceRef !== "current") {
             setTimeout(() => {
               cmuxSafe("close-surface", "--surface", agent.surfaceRef);
-            }, 2000);
-          }
+            }, 500);
+          }, 500);
 
           agent.status = "failed";
           fleet.delete(params.agent_id);
