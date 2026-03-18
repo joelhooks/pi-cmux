@@ -135,14 +135,13 @@ function clearStatus(): void {
 
 // ── Focus detection ────────────────────────────────────
 
-function isWorkspaceFocused(): boolean {
-  try {
-    const raw = execFileSync("cmux", ["identify"], { encoding: "utf-8", timeout: 3000 });
-    const info = JSON.parse(raw);
-    return info.caller?.workspace_ref === info.focused?.workspace_ref;
-  } catch {
-    return false; // assume unfocused on error — better to notify than miss
-  }
+// Track whether the user is actively interacting with this session.
+// If they are, skip notifications — they're already watching.
+let _lastUserInputAt = 0;
+const ACTIVE_INTERACTION_WINDOW_MS = 30_000; // 30s — if user typed recently, they're here
+
+function isUserActive(): boolean {
+  return (Date.now() - _lastUserInputAt) < ACTIVE_INTERACTION_WINDOW_MS;
 }
 
 // ── Notification helper ────────────────────────────────
@@ -415,6 +414,7 @@ export default function cmuxExtension(pi: ExtensionAPI) {
 
   // ── Lifecycle: first prompt → auto-name session ──
   pi.on("before_agent_start", async (event, ctx) => {
+    _lastUserInputAt = Date.now();
     // Name the session from the first user prompt
     if (!_hasNamedSession && event.prompt) {
       _hasNamedSession = true;
@@ -484,10 +484,9 @@ export default function cmuxExtension(pi: ExtensionAPI) {
       }
     }
 
-    // Only notify + mark-unread if the workspace is NOT focused
-    const isFocused = isWorkspaceFocused();
+    // Only notify if the user isn't actively interacting with this session
     const sessionName = pi.getSessionName();
-    if (!isFocused) {
+    if (!isUserActive()) {
       notify("pi", sessionName ? `${sessionName} — waiting for input` : "Waiting for input");
       cmuxSafe("workspace-action", "--action", "mark-unread");
       playPeonPing("stop");
