@@ -280,6 +280,43 @@ function shortenPath(p: string): string {
   return p;
 }
 
+// ── Heartbeat ──────────────────────────────────────────
+
+const HEARTBEAT_INTERVAL_MS = 3000;
+
+let _heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+let _agentStartedAt: number | null = null;
+let _lastToolDesc: string | null = null;
+
+function formatElapsed(ms: number): string {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  return rem > 0 ? `${m}m ${rem}s` : `${m}m`;
+}
+
+function startHeartbeat(): void {
+  stopHeartbeat();
+  _agentStartedAt = Date.now();
+  _lastToolDesc = null;
+  _heartbeatTimer = setInterval(() => {
+    if (!_agentStartedAt) return;
+    const elapsed = formatElapsed(Date.now() - _agentStartedAt);
+    const label = _lastToolDesc || "Thinking";
+    cmuxSafe("set-status", STATUS_KEY, `${label} · ${elapsed}`, "--icon", "bolt.fill", "--color", "#4C8DFF");
+  }, HEARTBEAT_INTERVAL_MS);
+}
+
+function stopHeartbeat(): void {
+  if (_heartbeatTimer) {
+    clearInterval(_heartbeatTimer);
+    _heartbeatTimer = null;
+  }
+  _agentStartedAt = null;
+  _lastToolDesc = null;
+}
+
 // ── Extension ──────────────────────────────────────────
 
 export default function cmuxExtension(pi: ExtensionAPI) {
@@ -318,11 +355,12 @@ export default function cmuxExtension(pi: ExtensionAPI) {
     }
   });
 
-  // ── Lifecycle: agent running — clear attention state ──
+  // ── Lifecycle: agent running — clear attention state, start heartbeat ──
   pi.on("agent_start", async () => {
     cmuxSafe("clear-notifications");
     cmuxSafe("workspace-action", "--action", "mark-read");
     setStatus(STATUS_RUNNING);
+    startHeartbeat();
 
     // Apply pending session name from async haiku call
     if (_pendingSessionName) {
@@ -335,11 +373,15 @@ export default function cmuxExtension(pi: ExtensionAPI) {
   // ── Lifecycle: tool execution — live status updates (visible from other workspaces) ──
   pi.on("tool_execution_start", async (event) => {
     const desc = describeToolUse(event.toolName, event.args);
-    cmuxSafe("set-status", STATUS_KEY, desc, "--icon", "bolt.fill", "--color", "#4C8DFF");
+    _lastToolDesc = desc;
+    // Immediate update — heartbeat will append elapsed time on next tick
+    const elapsed = _agentStartedAt ? formatElapsed(Date.now() - _agentStartedAt) : "";
+    cmuxSafe("set-status", STATUS_KEY, elapsed ? `${desc} · ${elapsed}` : desc, "--icon", "bolt.fill", "--color", "#4C8DFF");
   });
 
   // ── Lifecycle: agent done → idle + summary, peon-ping ──
   pi.on("agent_end", async (event, ctx) => {
+    stopHeartbeat();
     // Set needs-input immediately (summary will overwrite async, keeping bell icon)
     setStatus(STATUS_NEEDS_INPUT);
 
@@ -376,6 +418,7 @@ export default function cmuxExtension(pi: ExtensionAPI) {
 
   // ── Lifecycle: session shutdown ──
   pi.on("session_shutdown", async () => {
+    stopHeartbeat();
     _pendingSessionName = null;
     _hasNamedSession = false;
     clearStatus();
