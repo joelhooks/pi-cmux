@@ -52,6 +52,24 @@ const STATUS_RUNNING = { value: "Running", icon: "bolt.fill", color: "#4C8DFF" }
 const STATUS_IDLE = { value: "Idle", icon: "pause.circle.fill", color: "#8E8E93" };
 const STATUS_NEEDS_INPUT = { value: "Needs input", icon: "bell.fill", color: "#4C8DFF" };
 
+// ── Fleet tracker (orchestrator only) ──────────────────
+
+interface AgentInfo {
+  id: string;
+  surfaceRef: string;
+  workspaceRef: string;
+  model: string;
+  cwd: string;
+  prompt: string;        // first 200 chars
+  status: "starting" | "running" | "idle" | "completed" | "failed";
+  spawnedAt: number;
+}
+
+const fleet = new Map<string, AgentInfo>();
+const MAX_AGENTS = parseInt(process.env.PI_CMUX_MAX_AGENTS || "5");
+let _hiveWorkspaceRef: string | null = null;
+let _hiveWorkspaceSurfaceCount = 0;
+
 // ── cmux CLI wrapper ───────────────────────────────────
 
 function cmux(...args: string[]): string {
@@ -141,7 +159,17 @@ function clearBuiltinStatus(): void {
 }
 
 // ── Focus detection ────────────────────────────────────
-// (removed — interaction recency doesn't reliably indicate focus)
+
+/** Check if this pi surface is currently focused by the user. */
+function isFocused(): boolean {
+  try {
+    const raw = cmux("identify");
+    const info = JSON.parse(raw);
+    return info.caller?.surface_ref === info.focused?.surface_ref;
+  } catch {
+    return false; // can't tell — assume not focused
+  }
+}
 
 // ── Notification helper ────────────────────────────────
 
@@ -487,10 +515,12 @@ export default function cmuxExtension(pi: ExtensionAPI) {
       }
     }
 
-    // Notify — sidebar status is the quiet signal, notification is the loud one
-    const sessionName = pi.getSessionName();
-    notify("pi", sessionName ? `${sessionName} — waiting for input` : "Waiting for input");
-    playPeonPing("stop");
+    // Notify — but only if the user isn't already looking at this surface
+    if (!isFocused()) {
+      const sessionName = pi.getSessionName();
+      notify("pi", sessionName ? `${sessionName} — waiting for input` : "Waiting for input");
+      playPeonPing("stop");
+    }
   });
 
   // ── Lifecycle: compaction — natural inflection point for rename ──
@@ -744,5 +774,429 @@ export default function cmuxExtension(pi: ExtensionAPI) {
       const icon = result.isError ? theme.fg("error", "✗") : theme.fg("success", "🔔");
       return new Text(`${icon} ${text}`, 0, 0);
     },
+  });
+
+  // ────────────────────────────────────────────────────────
+  // Fleet tools — orchestrator only (workers can't spawn workers)
+  // ────────────────────────────────────────────────────────
+
+  if (!IS_WORKER) {
+
+    // ── Tool: spawn_pi — launch a worker agent ──────────────
+
+    pi.registerTool({
+      name: "spawn_pi",
+      label: "Spawn Pi Agent",
+      description: [
+        "Spawn a new pi agent in a cmux workspace. The agent runs in a visible",
+        "terminal you can switch to at any time.",
+        "",
+        "The spawned agent loads extensions normally but with PI_CMUX_ROLE=worker,",
+        "which keeps sidebar/notifications but prevents recursive spawning.",
+      ].join("\n"),
+      parameters: Type.Object({
+        prompt: Type.String({ description: "Initial prompt for the agent" }),
+        cwd: Type.Optional(Type.String({ description: "Working directory (default: current)" })),
+        model: Type.Optional(Type.String({ description: "Model to use (default: anthropic/claude-opus-4-6)" })),
+        direction: Type.Optional(Type.Union([
+          Type.Literal("workspace"),
+          Type.Literal("right"),
+          Type.Literal("down"),
+        ], { description: "Where to place the agent (default: new workspace)" })),
+        skills: Type.Optional(Type.Array(Type.String(), {
+          description: "Skill names to load (e.g. ['next-best-practices'])",
+        })),
+      }),
+
+      async execute(_id, params) {
+        if (fleet.size >= MAX_AGENTS) {
+          return {
+            content: [{ type: "text", text: `Fleet limit reached (${MAX_AGENTS}). Kill an agent first.` }],
+            isError: true,
+          };
+        }
+
+        const agentId = Math.random().toString(36).slice(2, 10);
+        const cwd = params.cwd || process.cwd();
+        const model = params.model || "anthropic/claude-opus-4-6";
+        const direction = params.direction || "workspace";
+
+        // Remember where we are so we can switch back
+        let orchestratorWorkspace: string | null = null;
+        try {
+          const id = cmux("identify");
+          const info = JSON.parse(id);
+          orchestratorWorkspace = info.caller?.workspace_ref || null;
+        } catch {}
+
+        try {
+          // 1. Create the surface
+          let surfaceRef: string;
+          let workspaceRef: string;
+
+          if (direction === "workspace") {
+            // First worker: create a dedicated "hive" workspace
+            // Subsequent workers: split inside the hive workspace
+            if (!_hiveWorkspaceRef) {
+              // Create the hive workspace
+              const result = cmux("new-workspace", "--cwd", cwd);
+              const wsMatch = result.match(/workspace:\d+/);
+              _hiveWorkspaceRef = wsMatch ? wsMatch[0] : null;
+              if (!_hiveWorkspaceRef) throw new Error(`Failed to parse workspace ref from: ${result}`);
+
+              // Name it (safe — we just created it)
+              cmuxSafe("rename-workspace", "--workspace", _hiveWorkspaceRef, "🐝 hive");
+
+              // Select the hive workspace so new-pane creates inside it
+              // (passing --workspace to new-pane doesn't work for CLI-created workspaces)
+              cmux("select-workspace", "--workspace", _hiveWorkspaceRef);
+
+              // The default surface from new-workspace isn't a writable terminal.
+              // Create a real terminal pane in the hive, then close the default.
+              const defaultSurfaces = cmux("list-pane-surfaces", "--workspace", _hiveWorkspaceRef);
+              const defaultSf = defaultSurfaces.match(/surface:\d+/);
+
+              const paneResult = cmux("new-pane", "--type", "terminal", "--direction", "right");
+              const sfMatch = paneResult.match(/surface:\d+/);
+              surfaceRef = sfMatch ? sfMatch[0] : "";
+              if (!surfaceRef) throw new Error(`Failed to create terminal pane in hive workspace`);
+
+              // Close the default non-writable surface
+              if (defaultSf) cmuxSafe("close-surface", "--surface", defaultSf[0]);
+
+              workspaceRef = _hiveWorkspaceRef;
+              _hiveWorkspaceSurfaceCount = 1;
+            } else {
+              // Select hive workspace, then add a new terminal pane
+              cmux("select-workspace", "--workspace", _hiveWorkspaceRef);
+              const splitDir = _hiveWorkspaceSurfaceCount % 2 === 0 ? "right" : "down";
+              const paneResult = cmux("new-pane", "--type", "terminal", "--direction", splitDir);
+              const sfMatch = paneResult.match(/surface:\d+/);
+              surfaceRef = sfMatch ? sfMatch[0] : "";
+              if (!surfaceRef) throw new Error(`Failed to create terminal pane in hive workspace`);
+              workspaceRef = _hiveWorkspaceRef;
+              _hiveWorkspaceSurfaceCount++;
+            }
+          } else {
+            // Explicit split direction in current workspace
+            const result = cmux("new-split", direction);
+            const sfMatch = result.match(/surface:\d+/);
+            surfaceRef = sfMatch ? sfMatch[0] : "";
+            if (!surfaceRef) throw new Error(`Failed to parse surface ref from split: ${result}`);
+            const identify = cmuxSafe("identify");
+            if (identify) {
+              try {
+                const info = JSON.parse(identify);
+                workspaceRef = info.caller?.workspace_ref || "current";
+              } catch { workspaceRef = "current"; }
+            } else {
+              workspaceRef = "current";
+            }
+          }
+
+          // 2. Set cwd for the new surface
+          cmux("send", "--surface", surfaceRef, `cd ${cwd}`);
+          cmux("send-key", "--surface", surfaceRef, "Enter");
+
+          // 3. Build and send the pi command
+          const piArgs = ["pi", "--model", model, "--print"];
+          if (params.skills?.length) {
+            for (const skill of params.skills) piArgs.push("--skill", skill);
+          }
+          piArgs.push(JSON.stringify(params.prompt));
+
+          const envPrefix = `PI_CMUX_ROLE=worker`;
+          cmux("send", "--surface", surfaceRef, `${envPrefix} ${piArgs.join(" ")}`);
+          cmux("send-key", "--surface", surfaceRef, "Enter");
+
+          // 4. Register in fleet
+          const agent: AgentInfo = {
+            id: agentId,
+            surfaceRef,
+            workspaceRef,
+            model,
+            cwd,
+            prompt: params.prompt.slice(0, 200),
+            status: "starting",
+            spawnedAt: Date.now(),
+          };
+          fleet.set(agentId, agent);
+
+          // 5. Switch back to orchestrator workspace
+          if (orchestratorWorkspace && orchestratorWorkspace !== workspaceRef) {
+            cmuxSafe("select-workspace", "--workspace", orchestratorWorkspace);
+          }
+
+          // 6. Update sidebar with fleet count
+          cmuxSafe("set-status", "fleet",
+            `${fleet.size} agent${fleet.size > 1 ? "s" : ""}`,
+            "--icon", "person.3.fill", "--color", "#4C8DFF");
+
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                agent_id: agentId,
+                workspace: workspaceRef,
+                surface: surfaceRef,
+                model,
+                cwd,
+                status: "launched",
+              }, null, 2),
+            }],
+          };
+        } catch (e: any) {
+          return { content: [{ type: "text", text: `Failed to spawn: ${e.message}` }], isError: true };
+        }
+      },
+
+      renderCall(args, theme) {
+        const model = args.model ? theme.fg("dim", ` (${args.model})`) : "";
+        const prompt = args.prompt.length > 50 ? args.prompt.slice(0, 47) + "…" : args.prompt;
+        return new Text(
+          theme.fg("toolTitle", theme.bold("spawn_pi")) + model + " " + theme.fg("accent", prompt),
+          0, 0,
+        );
+      },
+
+      renderResult(result, _opts, theme) {
+        const txt = result.content[0];
+        const text = txt?.type === "text" ? txt.text : "";
+        if (result.isError) return new Text(theme.fg("error", `✗ ${text}`), 0, 0);
+        try {
+          const data = JSON.parse(text);
+          return new Text(
+            theme.fg("success", "✓") + ` agent:${data.agent_id} → ${data.workspace}`,
+            0, 0,
+          );
+        } catch {
+          return new Text(theme.fg("success", `✓ ${text}`), 0, 0);
+        }
+      },
+    });
+
+    // ── Tool: read_agent — read a worker's screen ───────────
+
+    pi.registerTool({
+      name: "read_agent",
+      label: "Read Agent",
+      description: "Read the terminal output of a spawned agent.",
+      parameters: Type.Object({
+        agent_id: Type.String({ description: "Agent ID from spawn_pi" }),
+        lines: Type.Optional(Type.Number({ description: "Lines to read (default: 30)" })),
+      }),
+
+      async execute(_id, params) {
+        const agent = fleet.get(params.agent_id);
+        if (!agent) {
+          return { content: [{ type: "text", text: `Agent ${params.agent_id} not found. Use list_agents to see active agents.` }], isError: true };
+        }
+        try {
+          const lines = String(params.lines || 30);
+          const screen = cmux("read-screen", "--surface", agent.surfaceRef, "--lines", lines);
+          return { content: [{ type: "text", text: screen }] };
+        } catch (e: any) {
+          return { content: [{ type: "text", text: e.message }], isError: true };
+        }
+      },
+
+      renderCall(args, theme) {
+        return new Text(
+          theme.fg("toolTitle", theme.bold("read_agent")) + " " + theme.fg("accent", args.agent_id),
+          0, 0,
+        );
+      },
+
+      renderResult(result, _opts, theme) {
+        const txt = result.content[0];
+        const text = txt?.type === "text" ? txt.text : "";
+        const icon = result.isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
+        const lines = text.split("\n");
+        const preview = lines.slice(0, 5).join("\n");
+        const suffix = lines.length > 5 ? theme.fg("dim", `\n… ${lines.length - 5} more lines`) : "";
+        return new Text(`${icon} ${preview}${suffix}`, 0, 0);
+      },
+    });
+
+    // ── Tool: send_agent — steer a worker ───────────────────
+
+    pi.registerTool({
+      name: "send_agent",
+      label: "Send to Agent",
+      description: "Send a message or instruction to a spawned agent.",
+      parameters: Type.Object({
+        agent_id: Type.String({ description: "Agent ID from spawn_pi" }),
+        message: Type.String({ description: "Message to send to the agent" }),
+      }),
+
+      async execute(_id, params) {
+        const agent = fleet.get(params.agent_id);
+        if (!agent) {
+          return { content: [{ type: "text", text: `Agent ${params.agent_id} not found.` }], isError: true };
+        }
+        try {
+          cmux("send", "--surface", agent.surfaceRef, params.message);
+          cmux("send-key", "--surface", agent.surfaceRef, "Enter");
+          return { content: [{ type: "text", text: `Sent to agent ${params.agent_id}` }] };
+        } catch (e: any) {
+          return { content: [{ type: "text", text: e.message }], isError: true };
+        }
+      },
+
+      renderCall(args, theme) {
+        const msg = args.message.length > 50 ? args.message.slice(0, 47) + "…" : args.message;
+        return new Text(
+          theme.fg("toolTitle", theme.bold("send_agent")) + " " +
+          theme.fg("accent", args.agent_id) + " " + theme.fg("dim", msg),
+          0, 0,
+        );
+      },
+
+      renderResult(result, _opts, theme) {
+        const txt = result.content[0];
+        const text = txt?.type === "text" ? txt.text : "";
+        const icon = result.isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
+        return new Text(`${icon} ${text}`, 0, 0);
+      },
+    });
+
+    // ── Tool: kill_agent — abort a worker ───────────────────
+
+    pi.registerTool({
+      name: "kill_agent",
+      label: "Kill Agent",
+      description: "Stop a spawned agent. Sends Ctrl-C and optionally closes the workspace.",
+      parameters: Type.Object({
+        agent_id: Type.String({ description: "Agent ID from spawn_pi" }),
+        close_workspace: Type.Optional(Type.Boolean({ description: "Also close the workspace (default: false)" })),
+      }),
+
+      async execute(_id, params) {
+        const agent = fleet.get(params.agent_id);
+        if (!agent) {
+          return { content: [{ type: "text", text: `Agent ${params.agent_id} not found.` }], isError: true };
+        }
+        try {
+          // Send Ctrl-C to interrupt
+          cmuxSafe("send-key", "--surface", agent.surfaceRef, "C-c");
+          // Give it a moment, then send exit
+          setTimeout(() => {
+            cmuxSafe("send", "--surface", agent.surfaceRef, "exit");
+            cmuxSafe("send-key", "--surface", agent.surfaceRef, "Enter");
+          }, 1000);
+
+          if (params.close_workspace && agent.workspaceRef !== "current") {
+            setTimeout(() => {
+              cmuxSafe("close-surface", "--surface", agent.surfaceRef);
+            }, 2000);
+          }
+
+          agent.status = "failed";
+          fleet.delete(params.agent_id);
+
+          // Update sidebar
+          if (fleet.size > 0) {
+            cmuxSafe("set-status", "fleet",
+              `${fleet.size} agent${fleet.size > 1 ? "s" : ""}`,
+              "--icon", "person.3.fill", "--color", "#4C8DFF");
+          } else {
+            cmuxSafe("clear-status", "fleet");
+            // Close the hive workspace when last agent is killed
+            if (_hiveWorkspaceRef && params.close_workspace) {
+              cmuxSafe("close-workspace", "--workspace", _hiveWorkspaceRef);
+              _hiveWorkspaceRef = null;
+              _hiveWorkspaceSurfaceCount = 0;
+            }
+          }
+
+          return { content: [{ type: "text", text: `Killed agent ${params.agent_id}` }] };
+        } catch (e: any) {
+          return { content: [{ type: "text", text: e.message }], isError: true };
+        }
+      },
+
+      renderCall(args, theme) {
+        return new Text(
+          theme.fg("toolTitle", theme.bold("kill_agent")) + " " + theme.fg("error", args.agent_id),
+          0, 0,
+        );
+      },
+
+      renderResult(result, _opts, theme) {
+        const txt = result.content[0];
+        const text = txt?.type === "text" ? txt.text : "";
+        const icon = result.isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
+        return new Text(`${icon} ${text}`, 0, 0);
+      },
+    });
+
+    // ── Tool: list_agents — show fleet status ───────────────
+
+    pi.registerTool({
+      name: "list_agents",
+      label: "List Agents",
+      description: "Show all spawned agents and their status.",
+      parameters: Type.Object({}),
+
+      async execute() {
+        if (fleet.size === 0) {
+          return { content: [{ type: "text", text: "No agents spawned." }] };
+        }
+
+        const lines: string[] = [];
+        for (const [id, agent] of fleet) {
+          const elapsed = Math.round((Date.now() - agent.spawnedAt) / 1000);
+          const mins = Math.floor(elapsed / 60);
+          const secs = elapsed % 60;
+          const time = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+          lines.push(
+            `${id}  ${agent.workspaceRef}  ${agent.model}  ${agent.status}  ${time}\n` +
+            `  cwd: ${agent.cwd}\n` +
+            `  prompt: ${agent.prompt}`
+          );
+        }
+
+        return { content: [{ type: "text", text: lines.join("\n\n") }] };
+      },
+
+      renderCall(_args, theme) {
+        return new Text(
+          theme.fg("toolTitle", theme.bold("list_agents")) + " " + theme.fg("dim", `(${fleet.size})`),
+          0, 0,
+        );
+      },
+
+      renderResult(result, _opts, theme) {
+        const txt = result.content[0];
+        const text = txt?.type === "text" ? txt.text : "";
+        if (fleet.size === 0) return new Text(theme.fg("dim", "No agents"), 0, 0);
+        const lines = text.split("\n");
+        const preview = lines.slice(0, 6).join("\n");
+        const suffix = lines.length > 6 ? theme.fg("dim", `\n… ${lines.length - 6} more lines`) : "";
+        return new Text(`${preview}${suffix}`, 0, 0);
+      },
+    });
+
+  } // end !IS_WORKER
+
+  // ── Fleet cleanup on session shutdown ─────────────────────
+
+  pi.on("session_shutdown", async () => {
+    // Kill all spawned agents
+    for (const [id, agent] of fleet) {
+      cmuxSafe("send-key", "--surface", agent.surfaceRef, "C-c");
+      setTimeout(() => {
+        cmuxSafe("send", "--surface", agent.surfaceRef, "exit");
+        cmuxSafe("send-key", "--surface", agent.surfaceRef, "Enter");
+      }, 500);
+    }
+    fleet.clear();
+    cmuxSafe("clear-status", "fleet");
+    // Close the hive workspace
+    if (_hiveWorkspaceRef) {
+      cmuxSafe("close-workspace", "--workspace", _hiveWorkspaceRef);
+      _hiveWorkspaceRef = null;
+      _hiveWorkspaceSurfaceCount = 0;
+    }
   });
 }
