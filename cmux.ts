@@ -141,15 +141,7 @@ function clearBuiltinStatus(): void {
 }
 
 // ── Focus detection ────────────────────────────────────
-
-// Track whether the user is actively interacting with this session.
-// If they are, skip notifications — they're already watching.
-let _lastUserInputAt = 0;
-const ACTIVE_INTERACTION_WINDOW_MS = 30_000; // 30s — if user typed recently, they're here
-
-function isUserActive(): boolean {
-  return (Date.now() - _lastUserInputAt) < ACTIVE_INTERACTION_WINDOW_MS;
-}
+// (removed — interaction recency doesn't reliably indicate focus)
 
 // ── Notification helper ────────────────────────────────
 
@@ -420,7 +412,6 @@ export default function cmuxExtension(pi: ExtensionAPI) {
 
   // ── Lifecycle: first prompt → auto-name session ──
   pi.on("before_agent_start", async (event, ctx) => {
-    _lastUserInputAt = Date.now();
     // Tell cmux the user is active — clears any pane attention indicator/flash
     cmuxSafe("claude-hook", "prompt-submit");
     // Name the session from the first user prompt
@@ -491,13 +482,10 @@ export default function cmuxExtension(pi: ExtensionAPI) {
       }
     }
 
-    // Only notify if the user isn't actively interacting with this session
+    // Notify — sidebar status is the quiet signal, notification is the loud one
     const sessionName = pi.getSessionName();
-    if (!isUserActive()) {
-      notify("pi", sessionName ? `${sessionName} — waiting for input` : "Waiting for input");
-      // No mark-unread — it bounces the workspace tab. Notification is enough.
-      playPeonPing("stop");
-    }
+    notify("pi", sessionName ? `${sessionName} — waiting for input` : "Waiting for input");
+    playPeonPing("stop");
   });
 
   // ── Lifecycle: compaction — natural inflection point for rename ──
