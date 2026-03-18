@@ -5,7 +5,7 @@
  *   - session_start:     Set "Idle" status, auto-name session via haiku.
  *   - agent_start:       Set sidebar to "Running" (blue bolt).
  *   - tool_execution_start: Live tool activity in sidebar (visible from other workspaces).
- *   - agent_end:         "Needs input" (blue bell) + cmux notification + mark-unread + peon-ping.
+ *   - agent_end:         "Needs input" (blue bell) + cmux notification + peon-ping.
  *   - session_shutdown:  Clear status and agent PID.
  *
  * Session naming:
@@ -405,7 +405,6 @@ export default function cmuxExtension(pi: ExtensionAPI) {
     // Clear stale state from previous sessions
     cmuxSafe("clear-notifications");
     cmuxSafe("clear-log");
-    cmuxSafe("workspace-action", "--action", "mark-read");
     setStatus(STATUS_IDLE);
     if (existingName) {
       cmuxSafe("set-status", SESSION_NAME_KEY, existingName, "--icon", "text.bubble", "--color", "#8E8E93");
@@ -430,7 +429,6 @@ export default function cmuxExtension(pi: ExtensionAPI) {
   // ── Lifecycle: agent running — clear attention state, start heartbeat ──
   pi.on("agent_start", async () => {
     cmuxSafe("clear-notifications");
-    cmuxSafe("workspace-action", "--action", "mark-read");
     setStatus(STATUS_RUNNING);
     startHeartbeat();
 
@@ -488,7 +486,7 @@ export default function cmuxExtension(pi: ExtensionAPI) {
     const sessionName = pi.getSessionName();
     if (!isUserActive()) {
       notify("pi", sessionName ? `${sessionName} — waiting for input` : "Waiting for input");
-      cmuxSafe("workspace-action", "--action", "mark-unread");
+      // No mark-unread — it bounces the workspace tab. Notification is enough.
       playPeonPing("stop");
     }
   });
@@ -512,7 +510,6 @@ export default function cmuxExtension(pi: ExtensionAPI) {
     cmuxSafe("clear-status", SESSION_NAME_KEY);
     cmuxSafe("clear-notifications");
     cmuxSafe("clear-progress");
-    cmuxSafe("workspace-action", "--action", "mark-read");
   });
 
   // ── Apply pending session name between turns ──
