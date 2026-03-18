@@ -39,7 +39,8 @@ import * as path from "node:path";
 // ── Config ─────────────────────────────────────────────
 
 const STATUS_KEY = "pi_agent";
-// Session name is shown in pi's footer — no need to duplicate in sidebar.
+// Session name — first item under workspace label (sorts before pi_agent).
+const SESSION_NAME_KEY = "0_session";
 const NAMING_MODEL = process.env.PI_CMUX_NAMING_MODEL || "claude-haiku-4-5";
 // Helper pi subprocesses must not reload this extension or they recurse forever.
 const CMUX_CHILD_ENV = "PI_CMUX_CHILD";
@@ -298,6 +299,9 @@ export default function cmuxExtension(pi: ExtensionAPI) {
     cmuxSafe("clear-log");
     cmuxSafe("workspace-action", "--action", "mark-read");
     setStatus(STATUS_IDLE);
+    if (existingName) {
+      cmuxSafe("set-status", SESSION_NAME_KEY, existingName, "--icon", "text.bubble", "--color", "#8E8E93");
+    }
   });
 
   // ── Lifecycle: first prompt → auto-name session ──
@@ -323,6 +327,7 @@ export default function cmuxExtension(pi: ExtensionAPI) {
     // Apply pending session name from async haiku call
     if (_pendingSessionName) {
       pi.setSessionName(_pendingSessionName);
+      cmuxSafe("set-status", SESSION_NAME_KEY, _pendingSessionName, "--icon", "text.bubble", "--color", "#8E8E93");
       _pendingSessionName = null;
     }
   });
@@ -374,6 +379,7 @@ export default function cmuxExtension(pi: ExtensionAPI) {
     _pendingSessionName = null;
     _hasNamedSession = false;
     clearStatus();
+    cmuxSafe("clear-status", SESSION_NAME_KEY);
     cmuxSafe("clear-notifications");
     cmuxSafe("clear-progress");
     cmuxSafe("workspace-action", "--action", "mark-read");
@@ -383,6 +389,7 @@ export default function cmuxExtension(pi: ExtensionAPI) {
   pi.on("context", async () => {
     if (_pendingSessionName) {
       pi.setSessionName(_pendingSessionName);
+      cmuxSafe("set-status", SESSION_NAME_KEY, _pendingSessionName, "--icon", "text.bubble", "--color", "#8E8E93");
       _pendingSessionName = null;
     }
   });
