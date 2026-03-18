@@ -132,6 +132,18 @@ function clearStatus(): void {
   cmuxSafe("clear-status", STATUS_KEY);
 }
 
+// ── Focus detection ────────────────────────────────────
+
+function isWorkspaceFocused(): boolean {
+  try {
+    const raw = execFileSync("cmux", ["identify"], { encoding: "utf-8", timeout: 3000 });
+    const info = JSON.parse(raw);
+    return info.caller?.workspace_ref === info.focused?.workspace_ref;
+  } catch {
+    return false; // assume unfocused on error — better to notify than miss
+  }
+}
+
 // ── Notification helper ────────────────────────────────
 
 function notify(title: string, body?: string, subtitle?: string): void {
@@ -351,11 +363,14 @@ export default function cmuxExtension(pi: ExtensionAPI) {
       generateTurnSummary(lastAssistantText, ctx.cwd);
     }
 
-    // cmux notification + mark workspace unread so the tab lights up
+    // Only notify + mark-unread if the workspace is NOT focused
+    const isFocused = isWorkspaceFocused();
     const sessionName = pi.getSessionName();
-    notify("pi", sessionName ? `${sessionName} — waiting for input` : "Waiting for input");
-    cmuxSafe("workspace-action", "--action", "mark-unread");
-    playPeonPing("stop");
+    if (!isFocused) {
+      notify("pi", sessionName ? `${sessionName} — waiting for input` : "Waiting for input");
+      cmuxSafe("workspace-action", "--action", "mark-unread");
+      playPeonPing("stop");
+    }
   });
 
   // ── Lifecycle: session shutdown ──
