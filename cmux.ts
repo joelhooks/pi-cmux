@@ -58,12 +58,14 @@ const STATUS_NEEDS_INPUT = { value: "Needs input", icon: "bell.fill", color: "#4
 interface AgentInfo {
   id: string;
   surfaceRef: string;
+  paneRef: string;
   workspaceRef: string;
   model: string;
   cwd: string;
   prompt: string;        // first 200 chars
   status: "starting" | "running" | "idle" | "completed" | "failed";
   spawnedAt: number;
+  idleCount: number;     // consecutive idle polls — debounce false positives
 }
 
 const fleet = new Map<string, AgentInfo>();
@@ -363,6 +365,8 @@ function describeToolUse(toolName: string, args: any): string {
       return `Searching web`;
     case "codex":
       return `Spawning codex`;
+    case "mcq":
+      return `Waiting for input`;
     default:
       return `Using ${toolName}`;
   }
@@ -383,6 +387,7 @@ const HEARTBEAT_INTERVAL_MS = 3000;
 let _heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 let _agentStartedAt: number | null = null;
 let _lastToolDesc: string | null = null;
+let _waitingForHuman = false;
 
 function formatElapsed(ms: number): string {
   const s = Math.floor(ms / 1000);
@@ -398,6 +403,7 @@ function startHeartbeat(): void {
   _lastToolDesc = null;
   _heartbeatTimer = setInterval(() => {
     if (!_agentStartedAt) return;
+    if (_waitingForHuman) return; // don't overwrite "Needs input" during MCQ etc.
     const elapsed = formatElapsed(Date.now() - _agentStartedAt);
     const label = _lastToolDesc || "Thinking";
     cmuxSafe("set-status", STATUS_KEY, `${label} · ${elapsed}`, "--icon", "bolt.fill", "--color", "#4C8DFF");
@@ -441,6 +447,7 @@ export default function cmuxExtension(pi: ExtensionAPI) {
   pi.on("input", async () => {
     setStatus(STATUS_IDLE);
     cmuxSafe("clear-notifications");
+    cmuxSafe("workspace-action", "--action", "mark-read");
     cmuxSafe("claude-hook", "prompt-submit");
   });
 
@@ -461,6 +468,7 @@ export default function cmuxExtension(pi: ExtensionAPI) {
   // ── Lifecycle: agent running — clear attention state, start heartbeat ──
   pi.on("agent_start", async () => {
     cmuxSafe("clear-notifications");
+    _waitingForHuman = false;
     setStatus(STATUS_RUNNING);
     startHeartbeat();
 
@@ -472,13 +480,30 @@ export default function cmuxExtension(pi: ExtensionAPI) {
     }
   });
 
+  // Tools that block waiting for human input — treat like agent_end for attention purposes
+  const HUMAN_BLOCKING_TOOLS = new Set(["mcq"]);
+
   // ── Lifecycle: tool execution — live status updates (visible from other workspaces) ──
   pi.on("tool_execution_start", async (event) => {
     const desc = describeToolUse(event.toolName, event.args);
     _lastToolDesc = desc;
-    // Immediate update — heartbeat will append elapsed time on next tick
-    const elapsed = _agentStartedAt ? formatElapsed(Date.now() - _agentStartedAt) : "";
-    cmuxSafe("set-status", STATUS_KEY, elapsed ? `${desc} · ${elapsed}` : desc, "--icon", "bolt.fill", "--color", "#4C8DFF");
+
+    if (HUMAN_BLOCKING_TOOLS.has(event.toolName)) {
+      // Human-blocking tool: flip to "Needs input" and notify
+      _waitingForHuman = true;
+      setStatus(STATUS_NEEDS_INPUT);
+      cmuxSafe("workspace-action", "--action", "mark-unread");
+      if (!isFocused()) {
+        const sessionName = pi.getSessionName();
+        notify("pi", sessionName ? `${sessionName} — needs input (${event.toolName})` : `Needs input (${event.toolName})`);
+        playPeonPing("stop");
+      }
+    } else {
+      // Normal tool: clear human-waiting flag and show activity
+      _waitingForHuman = false;
+      const elapsed = _agentStartedAt ? formatElapsed(Date.now() - _agentStartedAt) : "";
+      cmuxSafe("set-status", STATUS_KEY, elapsed ? `${desc} · ${elapsed}` : desc, "--icon", "bolt.fill", "--color", "#4C8DFF");
+    }
   });
 
   // ── Lifecycle: agent done → idle + summary, peon-ping ──
@@ -514,11 +539,15 @@ export default function cmuxExtension(pi: ExtensionAPI) {
       }
     }
 
-    // Notify — but only if the user isn't already looking at this surface
+    // Mark workspace tab as unread (visual indicator) + notify if not focused.
+    // Workers skip notifications: the orchestrator's completion detection handles fleet alerts.
     if (!isFocused()) {
-      const sessionName = pi.getSessionName();
-      notify("pi", sessionName ? `${sessionName} — waiting for input` : "Waiting for input");
-      playPeonPing("stop");
+      cmuxSafe("workspace-action", "--action", "mark-unread");
+      if (!IS_WORKER) {
+        const sessionName = pi.getSessionName();
+        notify("pi", sessionName ? `${sessionName} — waiting for input` : "Waiting for input");
+        playPeonPing("stop");
+      }
     }
   });
 
@@ -800,7 +829,7 @@ export default function cmuxExtension(pi: ExtensionAPI) {
         direction: Type.Optional(Type.Union([
           Type.Literal("right"),
           Type.Literal("down"),
-        ], { description: "Split direction for the worker pane (default: right)" })),
+        ], { description: "Split direction for the worker pane (default: first worker splits right, subsequent split down)" })),
         skills: Type.Optional(Type.Array(Type.String(), {
           description: "Skill names to load (e.g. ['next-best-practices'])",
         })),
@@ -817,7 +846,11 @@ export default function cmuxExtension(pi: ExtensionAPI) {
         const agentId = Math.random().toString(36).slice(2, 10);
         const cwd = params.cwd || process.cwd();
         const model = params.model || "anthropic/claude-opus-4-6";
-        const direction = params.direction || "right";
+        // First worker splits right (vertical column), subsequent workers split down
+        // from an existing worker surface (stacking in the worker column).
+        // Prevents width-crushing from multiple vertical splits.
+        const isFirstWorker = fleet.size === 0;
+        const direction = params.direction || (isFirstWorker ? "right" : "down");
 
         try {
           // 1. Create the surface
@@ -825,16 +858,27 @@ export default function cmuxExtension(pi: ExtensionAPI) {
           let workspaceRef: string;
 
           {
-            // Split a new terminal pane in the current workspace
-            const splitDir = direction;
-            const paneResult = cmux("new-pane", "--type", "terminal", "--direction", splitDir);
+            let paneResult: string;
+
+            // Find an existing worker to split from (for stacking in the worker column)
+            const existingWorker = isFirstWorker ? null : fleet.values().next().value;
+
+            if (existingWorker && !params.direction) {
+              // Subsequent workers: split DOWN from an existing worker's surface.
+              // Stacks in the worker column without stealing focus from other workspaces.
+              paneResult = cmux("new-split", direction, "--surface", existingWorker.surfaceRef);
+            } else {
+              // First worker or explicit direction override
+              paneResult = cmux("new-pane", "--type", "terminal", "--direction", direction);
+            }
+
             const sfMatch = paneResult.match(/surface:\d+/);
             const pnMatch = paneResult.match(/pane:\d+/);
             surfaceRef = sfMatch ? sfMatch[0] : "";
             if (!surfaceRef) throw new Error(`Failed to create terminal pane: ${paneResult}`);
 
-            // Resize worker pane to ~1/3
-            if (pnMatch) cmuxSafe("resize-pane", "--pane", pnMatch[0], "-L", "--amount", "40");
+            // Resize first worker pane to ~1/3 width
+            if (isFirstWorker && pnMatch) cmuxSafe("resize-pane", "--pane", pnMatch[0], "-L", "--amount", "40");
 
             // Get current workspace ref
             const identify = cmuxSafe("identify");
@@ -864,16 +908,23 @@ export default function cmuxExtension(pi: ExtensionAPI) {
           cmux("send", "--surface", surfaceRef, fullCmd);
           cmux("send-key", "--surface", surfaceRef, "Enter");
 
+          // 5. Name the worker pane for easy identification
+          const shortPrompt = params.prompt.slice(0, 30).replace(/["\n]/g, " ").trim();
+          cmuxSafe("rename-tab", "--surface", surfaceRef, `🐝 ${agentId} · ${shortPrompt}`);
+
           // 4. Register in fleet
+          const paneRef = pnMatch ? pnMatch[0] : "";
           const agent: AgentInfo = {
             id: agentId,
             surfaceRef,
+            paneRef,
             workspaceRef,
             model,
             cwd,
             prompt: params.prompt.slice(0, 200),
             status: "starting",
             spawnedAt: Date.now(),
+            idleCount: 0,
           };
           fleet.set(agentId, agent);
 
@@ -1128,6 +1179,7 @@ export default function cmuxExtension(pi: ExtensionAPI) {
     let _completionPollTimer: ReturnType<typeof setInterval> | null = null;
     const COMPLETION_POLL_MS = 5000;
     const SPAWN_GRACE_MS = 15000; // let pi boot before checking
+    const IDLE_POLLS_REQUIRED = 2; // consecutive idle polls before declaring completion (debounce)
 
     // Detect agent idle:
     // Pi footer visible (cost info) WITHOUT a spinner = agent finished, pi at input prompt
@@ -1153,6 +1205,11 @@ export default function cmuxExtension(pi: ExtensionAPI) {
 
           const piIdle = HAS_PI_FOOTER.test(screen) && !IS_WORKING.test(screen);
           if (piIdle || IDLE_SHELL_RE.test(screen)) {
+            agent.idleCount++;
+            // Debounce: require consecutive idle polls to avoid false positives
+            // from brief inter-tool gaps where footer is visible without spinner
+            if (agent.idleCount < IDLE_POLLS_REQUIRED) continue;
+
             agent.status = "idle";
             pi.sendMessage(
               {
@@ -1163,6 +1220,9 @@ export default function cmuxExtension(pi: ExtensionAPI) {
               { triggerTurn: true },
             );
             cmuxSafe("log", "--level", "info", "--source", "fleet", "--", `Agent ${id} idle`);
+          } else {
+            // Reset counter — agent is actively working
+            agent.idleCount = 0;
           }
         }
       }, COMPLETION_POLL_MS);
