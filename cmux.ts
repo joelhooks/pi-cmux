@@ -869,6 +869,7 @@ export default function cmuxExtension(pi: ExtensionAPI) {
           let surfaceRef: string;
           let workspaceRef: string;
 
+          let pnMatch: RegExpMatchArray | null = null;
           {
             let paneResult: string;
 
@@ -889,7 +890,7 @@ export default function cmuxExtension(pi: ExtensionAPI) {
             spawnLog.paneResult = paneResult;
 
             const sfMatch = paneResult.match(/surface:\d+/);
-            const pnMatch = paneResult.match(/pane:\d+/);
+            pnMatch = paneResult.match(/pane:\d+/);
             surfaceRef = sfMatch ? sfMatch[0] : "";
             if (!surfaceRef) throw new Error(`Failed to create terminal pane: ${paneResult}`);
 
