@@ -852,6 +852,18 @@ export default function cmuxExtension(pi: ExtensionAPI) {
         const isFirstWorker = fleet.size === 0;
         const direction = params.direction || (isFirstWorker ? "right" : "down");
 
+        // ── Structured logging for spawn diagnostics ──
+        const spawnLog = {
+          agentId,
+          fleetSize: fleet.size,
+          isFirstWorker,
+          directionParam: params.direction || null,
+          directionResolved: direction,
+          existingWorkerRef: null as string | null,
+          splitMethod: "" as string,
+          paneResult: "" as string,
+        };
+
         try {
           // 1. Create the surface
           let surfaceRef: string;
@@ -866,11 +878,15 @@ export default function cmuxExtension(pi: ExtensionAPI) {
             if (existingWorker && !params.direction) {
               // Subsequent workers: split DOWN from an existing worker's surface.
               // Stacks in the worker column without stealing focus from other workspaces.
+              spawnLog.existingWorkerRef = existingWorker.surfaceRef;
+              spawnLog.splitMethod = "new-split";
               paneResult = cmux("new-split", direction, "--surface", existingWorker.surfaceRef);
             } else {
               // First worker or explicit direction override
+              spawnLog.splitMethod = "new-pane";
               paneResult = cmux("new-pane", "--type", "terminal", "--direction", direction);
             }
+            spawnLog.paneResult = paneResult;
 
             const sfMatch = paneResult.match(/surface:\d+/);
             const pnMatch = paneResult.match(/pane:\d+/);
@@ -936,6 +952,10 @@ export default function cmuxExtension(pi: ExtensionAPI) {
             `${fleet.size} agent${fleet.size > 1 ? "s" : ""}`,
             "--icon", "person.3.fill", "--color", "#4C8DFF");
 
+          // ── Log spawn success ──
+          cmuxSafe("log", "--level", "info", "--source", "fleet", "--",
+            `spawn OK: ${JSON.stringify(spawnLog)}`);
+
           return {
             content: [{
               type: "text",
@@ -950,6 +970,10 @@ export default function cmuxExtension(pi: ExtensionAPI) {
             }],
           };
         } catch (e: any) {
+          // ── Log spawn failure ──
+          spawnLog.paneResult = e.message;
+          cmuxSafe("log", "--level", "error", "--source", "fleet", "--",
+            `spawn FAIL: ${JSON.stringify(spawnLog)}`);
           return { content: [{ type: "text", text: `Failed to spawn: ${e.message}` }], isError: true };
         }
       },
@@ -1103,8 +1127,12 @@ export default function cmuxExtension(pi: ExtensionAPI) {
 
           }
 
+          cmuxSafe("log", "--level", "info", "--source", "fleet", "--",
+            `kill OK: agent=${params.agent_id} surface=${agent.surfaceRef} remaining=${fleet.size}`);
           return { content: [{ type: "text", text: `Killed agent ${params.agent_id}` }] };
         } catch (e: any) {
+          cmuxSafe("log", "--level", "error", "--source", "fleet", "--",
+            `kill FAIL: agent=${params.agent_id} error=${e.message}`);
           return { content: [{ type: "text", text: e.message }], isError: true };
         }
       },
