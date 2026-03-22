@@ -34,7 +34,7 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { execSync, execFileSync, spawn } from "node:child_process";
-import { writeFileSync, unlinkSync } from "node:fs";
+import { writeFileSync, unlinkSync, mkdirSync, readFileSync, readdirSync, existsSync } from "node:fs";
 import * as path from "node:path";
 
 // ── Config ─────────────────────────────────────────────
@@ -47,11 +47,46 @@ const NAMING_MODEL = process.env.PI_CMUX_NAMING_MODEL || "claude-haiku-4-5";
 const CMUX_CHILD_ENV = "PI_CMUX_CHILD";
 // Worker mode: full visibility, no subprocess spawns (session naming, turn summaries).
 const IS_WORKER = process.env.PI_CMUX_ROLE === "worker";
+const WORKER_AGENT_ID = process.env.PI_CMUX_AGENT_ID || null;
+
+// Fleet IPC: workers write status files, orchestrator reads them (no read-screen dependency)
+const FLEET_IPC_DIR = path.join(process.env.TMPDIR || "/tmp", "pi-fleet");
 
 // SF Symbols + colors matching cmux Claude Code integration
 const STATUS_RUNNING = { value: "Running", icon: "bolt.fill", color: "#4C8DFF" };
 const STATUS_IDLE = { value: "Idle", icon: "pause.circle.fill", color: "#8E8E93" };
 const STATUS_NEEDS_INPUT = { value: "Needs input", icon: "bell.fill", color: "#4C8DFF" };
+
+// ── Fleet IPC: file-based status signals between workers and orchestrator ──
+// Workers write status files on lifecycle events. Orchestrator polls the directory.
+// This replaces read-screen polling — ghostty surfaces take too long to initialize
+// for programmatically created terminals, making read-screen unreliable.
+
+interface FleetStatusFile {
+  agentId: string;
+  status: "running" | "idle" | "needs-input";
+  timestamp: number;
+  turnCount?: number;
+}
+
+function writeFleetStatus(agentId: string, status: FleetStatusFile["status"], extra?: Partial<FleetStatusFile>): void {
+  try {
+    mkdirSync(FLEET_IPC_DIR, { recursive: true });
+    const data: FleetStatusFile = { agentId, status, timestamp: Date.now(), ...extra };
+    writeFileSync(path.join(FLEET_IPC_DIR, `${agentId}.json`), JSON.stringify(data) + "\n");
+  } catch { /* best-effort */ }
+}
+
+function readFleetStatus(agentId: string): FleetStatusFile | null {
+  try {
+    const raw = readFileSync(path.join(FLEET_IPC_DIR, `${agentId}.json`), "utf-8");
+    return JSON.parse(raw.trim());
+  } catch { return null; }
+}
+
+function clearFleetStatus(agentId: string): void {
+  try { unlinkSync(path.join(FLEET_IPC_DIR, `${agentId}.json`)); } catch { /* ok */ }
+}
 
 // ── Fleet tracker (orchestrator only) ──────────────────
 
@@ -472,6 +507,9 @@ export default function cmuxExtension(pi: ExtensionAPI) {
     setStatus(STATUS_RUNNING);
     startHeartbeat();
 
+    // Worker IPC: signal orchestrator that we're running
+    if (IS_WORKER && WORKER_AGENT_ID) writeFleetStatus(WORKER_AGENT_ID, "running");
+
     // Apply pending session name from async haiku call
     if (_pendingSessionName) {
       pi.setSessionName(_pendingSessionName);
@@ -493,6 +531,7 @@ export default function cmuxExtension(pi: ExtensionAPI) {
       _waitingForHuman = true;
       setStatus(STATUS_NEEDS_INPUT);
       cmuxSafe("workspace-action", "--action", "mark-unread");
+      if (IS_WORKER && WORKER_AGENT_ID) writeFleetStatus(WORKER_AGENT_ID, "needs-input");
       if (!isFocused()) {
         const sessionName = pi.getSessionName();
         notify("pi", sessionName ? `${sessionName} — needs input (${event.toolName})` : `Needs input (${event.toolName})`);
@@ -512,6 +551,9 @@ export default function cmuxExtension(pi: ExtensionAPI) {
     _turnCount++;
     // Set needs-input immediately (summary will overwrite async, keeping bell icon)
     setStatus(STATUS_NEEDS_INPUT);
+
+    // Worker IPC: signal orchestrator that we're idle
+    if (IS_WORKER && WORKER_AGENT_ID) writeFleetStatus(WORKER_AGENT_ID, "idle", { turnCount: _turnCount });
 
     // Extract last assistant message text for summary
     let lastAssistantText = "";
@@ -570,6 +612,8 @@ export default function cmuxExtension(pi: ExtensionAPI) {
     cmuxSafe("clear-status", SESSION_NAME_KEY);
     cmuxSafe("clear-notifications");
     cmuxSafe("clear-progress");
+    // Worker IPC: clean up status file
+    if (IS_WORKER && WORKER_AGENT_ID) clearFleetStatus(WORKER_AGENT_ID);
   });
 
   // ── Apply pending session name between turns ──
@@ -921,7 +965,7 @@ export default function cmuxExtension(pi: ExtensionAPI) {
           piArgs.push(`@${promptFile}`);
 
           // 4. Send cd + pi as one chained command, clean up prompt file after
-          const fullCmd = `cd ${cwd} && PI_CMUX_ROLE=worker ${piArgs.join(" ")}; rm -f ${promptFile}`;
+          const fullCmd = `cd ${cwd} && PI_CMUX_ROLE=worker PI_CMUX_AGENT_ID=${agentId} ${piArgs.join(" ")}; rm -f ${promptFile}`;
           cmux("send", "--surface", surfaceRef, fullCmd);
           cmux("send-key", "--surface", surfaceRef, "Enter");
 
@@ -1200,22 +1244,16 @@ export default function cmuxExtension(pi: ExtensionAPI) {
       },
     });
 
-    // ── Completion detection polling ──────────────────────────
+    // ── Completion detection via fleet IPC files ──────────────
     //
-    // Polls each agent's terminal every 5s. When a shell prompt is visible
-    // (❯ or $), pi has exited → mark agent idle and notify the orchestrator.
+    // Workers write status files to FLEET_IPC_DIR on agent_start/agent_end.
+    // Orchestrator polls the directory. No read-screen dependency.
+    // This replaced screen-scraping which was unreliable — ghostty surfaces
+    // for programmatically created terminals take too long to initialize.
 
     let _completionPollTimer: ReturnType<typeof setInterval> | null = null;
-    const COMPLETION_POLL_MS = 5000;
-    const SPAWN_GRACE_MS = 15000; // let pi boot before checking
-    const IDLE_POLLS_REQUIRED = 2; // consecutive idle polls before declaring completion (debounce)
-
-    // Detect agent idle:
-    // Pi footer visible (cost info) WITHOUT a spinner = agent finished, pi at input prompt
-    // Shell prompt (❯ or $) = pi exited back to shell
-    const HAS_PI_FOOTER = /\$[0-9]+\.[0-9]+/;           // $0.175 in footer
-    const IS_WORKING = /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s|Working|Thinking/;  // spinner or status
-    const IDLE_SHELL_RE = /^[❯$]\s*$/m;                  // shell prompt alone on line
+    const COMPLETION_POLL_MS = 3000;
+    const SPAWN_GRACE_MS = 5000; // shorter grace — IPC files appear faster than ghostty init
 
     function startCompletionPolling(): void {
       if (_completionPollTimer) return;
@@ -1229,29 +1267,25 @@ export default function cmuxExtension(pi: ExtensionAPI) {
           if (agent.status === "idle" || agent.status === "completed" || agent.status === "failed") continue;
           if (Date.now() - agent.spawnedAt < SPAWN_GRACE_MS) continue;
 
-          const screen = cmuxSafe("read-screen", "--surface", agent.surfaceRef, "--lines", "5");
-          if (!screen) continue;
+          const ipcStatus = readFleetStatus(id);
+          if (!ipcStatus) continue; // no status file yet — worker hasn't written one
 
-          const piIdle = HAS_PI_FOOTER.test(screen) && !IS_WORKING.test(screen);
-          if (piIdle || IDLE_SHELL_RE.test(screen)) {
-            agent.idleCount++;
-            // Debounce: require consecutive idle polls to avoid false positives
-            // from brief inter-tool gaps where footer is visible without spinner
-            if (agent.idleCount < IDLE_POLLS_REQUIRED) continue;
-
+          if (ipcStatus.status === "idle" || ipcStatus.status === "needs-input") {
             agent.status = "idle";
+            const reason = ipcStatus.status === "needs-input" ? "needs input" : "finished";
             pi.sendMessage(
               {
                 customType: "agent-completion",
-                content: `🐝 Agent ${id} has finished and is idle.\nPrompt: ${agent.prompt}\nSurface: ${agent.surfaceRef}`,
+                content: `🐝 Agent ${id} has ${reason}.\nPrompt: ${agent.prompt}\nSurface: ${agent.surfaceRef}`,
                 display: true,
               },
               { triggerTurn: true },
             );
-            cmuxSafe("log", "--level", "info", "--source", "fleet", "--", `Agent ${id} idle`);
-          } else {
-            // Reset counter — agent is actively working
-            agent.idleCount = 0;
+            cmuxSafe("log", "--level", "info", "--source", "fleet", "--",
+              `Agent ${id} ${reason} (ipc: ${JSON.stringify(ipcStatus)})`);
+          } else if (ipcStatus.status === "running" && agent.status === "starting") {
+            // Worker confirmed it's running — update from "starting"
+            agent.status = "running";
           }
         }
       }, COMPLETION_POLL_MS);
