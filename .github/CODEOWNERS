@@ -1,0 +1,11 @@
+# Supply-chain choke points: changes here can run code, alter dependency resolution, or change the pi extension.
+.github/workflows/ @joelhooks
+.github/actions/ @joelhooks
+package.json @joelhooks
+package-lock.json @joelhooks
+bun.lock @joelhooks
+pnpm-lock.yaml @joelhooks
+yarn.lock @joelhooks
+.npmrc @joelhooks
+cmux.ts @joelhooks
+skills/ @joelhooks
