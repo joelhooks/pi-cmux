@@ -7,9 +7,34 @@ description: "Control cmux terminal multiplexer from pi — read other terminal 
 
 Pi runs inside cmux with full access to the cmux CLI via three extension tools: `cmux`, `cmux_status`, and `cmux_notify`. The cmux extension also automatically manages sidebar status (Running/Idle/Needs input) through pi lifecycle hooks.
 
+## Naming discipline
+
+When starting meaningful work or pivoting the core workstream, use the `cmux-workspace-naming` skill. Name the broad workspace theme in short Human Case, optionally with one useful emoji. Do not rename for tiny substeps.
+
+For multi-tab, multi-session, or multi-subagent workspaces:
+
+- Workspace/session name = umbrella theme shared by all lanes.
+- Tab/surface/child-session name = stable lane/role, only when helpful.
+- Parent/orchestrator owns workspace naming; child agents should not clobber it.
+- Use sidebar status/progress/log rows for live state instead of renaming tabs every time something starts/stops.
+- Keep the sidebar calm: avoid bouncy `Running`, `Checking`, `Fixing`, `Almost Done` title churn.
+- For 4-10 agents, boring is good: `Parent`, `Research 1`, `Research 2`, `Reviewer`, `Worker`, `CI Watch`.
+- Split into a new workspace/session when the lane becomes an independent workstream.
+
+Required flow:
+
+```
+cmux action="identify"
+cmux action="rename-workspace" args=["--workspace", "workspace:45", "🧭 cmux Naming Rules"]
+cmux action="focus-panel" args=["--workspace", "workspace:45", "--panel", "surface:80"]
+cmux action="tree" args=["--workspace", "workspace:45"]
+```
+
+Use the discovered refs, not guessed refs. Do not type rename commands into the active Pi terminal with `send`; that turns into user input instead of an operator command. Use the cmux tool or run the cmux CLI from a shell tool.
+
 ## Concepts
 
-**Refs** — cmux uses short refs to identify objects: `workspace:1`, `pane:2`, `surface:3`, `window:1`. Always run `cmux tree` first to discover current refs before targeting specific surfaces.
+**Refs** — cmux uses short refs to identify objects: `workspace:1`, `pane:2`, `surface:3`, `window:1`. Run `cmux identify` for the caller/focused refs, or `cmux tree` for layout discovery, before targeting specific surfaces.
 
 **Surfaces** — a surface is a single terminal or browser tab inside a pane. Each pane can have multiple surfaces (shown as tabs). Each workspace has one or more panes (splits).
 
@@ -69,7 +94,7 @@ Split directions: `left`, `right`, `up`, `down`.
 
 ```
 cmux action="select-workspace" args=["--workspace", "workspace:3"]
-cmux action="rename-workspace" args=["my-project"]
+cmux action="rename-workspace" args=["--workspace", "workspace:3", "🚢 Course Builder Deploys"]
 cmux action="focus-pane" args=["--pane", "pane:2"]
 cmux action="close-surface" args=["--surface", "surface:5"]
 cmux action="close-workspace" args=["--workspace", "workspace:4"]
@@ -82,8 +107,8 @@ Control the cmux sidebar for the current workspace.
 #### Status entries
 
 ```
-cmux_status action="set-status" key="build" value="Compiling..." icon="hammer.fill" color="#FF9500"
-cmux_status action="set-status" key="tests" value="14/20 passing" icon="checkmark.circle" color="#34C759"
+cmux_status action="set-status" key="build" value="Compiling..." icon="hammer.fill" color="#FF9500" priority=10
+cmux_status action="set-status" key="tests" value="14/20 passing" icon="checkmark.circle" color="#34C759" priority=10
 cmux_status action="clear-status" key="build"
 cmux_status action="sidebar-state"
 ```
@@ -100,6 +125,8 @@ Icons are SF Symbol names. Common ones:
 - `circle.dashed` — pending
 
 Colors are hex: `#4C8DFF` (blue), `#34C759` (green), `#FF3B30` (red), `#FF9500` (orange), `#8E8E93` (gray).
+
+`priority` controls sidebar ordering. Higher appears first; use negative priority for low-priority background rows.
 
 #### Progress bar
 
@@ -201,7 +228,12 @@ cmux action="new-pane" args=["--type", "browser", "--url", "http://localhost:300
 
 ## Automatic Lifecycle Status
 
-The cmux extension automatically manages a `pi_agent` sidebar status entry:
+The cmux extension automatically manages Pi sidebar metadata:
+
+- `pi_model` — current provider/model/thinking level
+- `pi_usage` — context usage, token totals, and cost
+- pane stack rows — active cmux panes/surfaces, with the running Pi pane annotated
+- lifecycle status — Idle/Running/Needs input shown on the active pane row
 
 | Pi Event | Sidebar Status | Icon | Color | Tab Indicator |
 |----------|---------------|------|-------|---------------|
@@ -211,9 +243,9 @@ The cmux extension automatically manages a `pi_agent` sidebar status entry:
 | Agent turn complete | Needs input + turn summary | `bell.fill` | blue | **mark-unread** + notification |
 | Session shutdown | *all cleared* | — | — | mark-read, clear notifications |
 
-The session name appears as a sidebar status entry (key `session`) — the workspace label is never modified by the extension and is left to the operator.
+Session naming is opt-in via `PI_CMUX_SESSION_NAMING=1`. When enabled, the session name appears as a sidebar status entry — the workspace label is never modified by the extension and is left to the operator.
 
-**Live tool activity**: Every tool execution updates the sidebar status with what pi is doing (e.g. "Reading ~/.zshrc", "Running grep", "Editing auth.ts"). This is always on and visible from other workspaces — useful for monitoring pi while focused elsewhere.
+**Live tool activity**: Every tool execution updates the active pane row with what pi is doing (e.g. "Reading ~/.zshrc", "Running grep", "Editing auth.ts"). This is always on and visible from other workspaces — useful for monitoring pi while focused elsewhere.
 
 **Attention cycle**: When the agent finishes a turn, the workspace tab is marked unread (lights up) and a cmux notification fires. When the user provides input and the agent starts working again, the tab is marked read and notifications are cleared. This gives a clean read/unread signal across workspaces.
 

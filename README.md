@@ -4,8 +4,12 @@ cmux integration extension for [pi](https://pi.dev). Standalone package — load
 
 ## What It Does
 
+This extension only activates for `pi` processes started inside a cmux terminal surface. In zellij, plain shells, or SSH sessions outside cmux, it cleanly no-ops.
+
 - **Sidebar status** — Running/Idle/Needs input with live tool activity
-- **Session naming** — auto-generates 2-4 word session name from first prompt
+- **Model + usage metadata** — current provider/model/thinking plus context, token, and cost totals in the cmux sidebar
+- **Pane stack** — shows the active cmux pane/surface stack and marks the pane running pi
+- **Session naming** — optional 2-4 word session names from the first prompt (`PI_CMUX_SESSION_NAMING=1`)
 - **Notifications** — native macOS notifications on agent_end + mark-unread tab indicator
 - **Attention cycle** — workspace tab lights up when agent needs input, clears when you type
 - **3 tools** — `cmux` (workspace/pane/surface control), `cmux_status` (sidebar), `cmux_notify` (notifications)
@@ -22,7 +26,7 @@ For agents spawned by an orchestrator, set `PI_CMUX_ROLE=worker` to keep all vis
 
 ```bash
 PI_CMUX_ROLE=worker pi --no-extensions -e /path/to/pi-cmux/cmux.ts \
-  --model claude-sonnet-4 "fix the auth bug"
+  --model openai-codex/gpt-5.5 "fix the auth bug"
 ```
 
 | Feature | Orchestrator | Worker |
@@ -48,7 +52,9 @@ Three-layer defense against recursive subprocess spawns:
 | Variable | Description |
 |----------|-------------|
 | `PI_CMUX_ROLE` | Set to `worker` for spawned agents |
-| `PI_CMUX_NAMING_MODEL` | Model for session naming (default: `claude-haiku-4-5`) |
+| `PI_CMUX_AGENT_ID` | Worker fleet id for file-based status IPC |
+| `PI_CMUX_SESSION_NAMING` | Set to `1` to enable helper-model session naming |
+| `PI_CMUX_NAMING_MODEL` | Model for session naming (default: `openai-codex/gpt-5.5`) |
 | `PI_CMUX_CHILD` | Set to `1` internally for helper subprocesses |
 
 ## License

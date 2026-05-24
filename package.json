@@ -1,7 +1,7 @@
 {
   "name": "@joelhooks/pi-cmux",
   "version": "0.1.0",
-  "description": "cmux integration extension for pi — sidebar status, notifications, live tool activity, workspace control",
+  "description": "cmux integration extension for pi — sidebar status, model/usage metadata, notifications, live tool activity, workspace control",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -16,8 +16,11 @@
     ]
   },
   "dependencies": {
-    "@mariozechner/pi-coding-agent": "*",
-    "@mariozechner/pi-tui": "*",
+    "@earendil-works/pi-coding-agent": "^0.74.1",
+    "@earendil-works/pi-tui": "^0.74.1",
     "@sinclair/typebox": "*"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3"
   }
 }

@@ -104,11 +104,12 @@ Workers are real pi sessions with curated extensions — NOT lobotomized `--no-e
 ```bash
 # Standard worker (most tasks)
 PI_CMUX_ROLE=worker pi -e /path/to/pi-cmux/cmux.ts \
-  --model claude-sonnet-4 "refactor the auth middleware"
+  --model openai-codex/gpt-5.5 "refactor the auth middleware"
 
-# Lightweight worker (lint, format)  
+# Lightweight worker (lint, format)
+# Use the current global Pi model policy unless Joel explicitly approves a cheaper worker model.
 PI_CMUX_ROLE=worker pi -e /path/to/pi-cmux/cmux.ts \
-  --tools read,bash --model claude-haiku-4-5 "lint src/"
+  --tools read,bash --model openai-codex/gpt-5.5 "lint src/"
 ```
 
 ### Agent identity
