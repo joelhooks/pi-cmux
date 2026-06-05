@@ -13,7 +13,7 @@ This extension activates for `pi` processes started inside a local cmux terminal
 - **Notifications** — native macOS notifications on agent_end + mark-unread tab indicator
 - **Attention cycle** — workspace tab lights up when agent needs input, clears when you type
 - **3 tools** — `cmux` (workspace/pane/surface control), `cmux_status` (sidebar), `cmux_notify` (notifications)
-- **cmux ssh awareness** — discovers `~/.cmux/bin/cmux` when Pi subprocesses do not inherit cmux PATH/env, exposes `remote-status`, and degrades sidebar writes when the remote relay lacks those commands
+- **cmux ssh awareness** — discovers `~/.cmux/bin/cmux` when Pi subprocesses do not inherit cmux PATH/env, exposes `remote-status`/`diagnose`, uses RPC fallbacks, and degrades sidebar writes when the remote relay lacks those commands
 
 ## Install
 
@@ -29,8 +29,10 @@ Supported today:
 
 - `cmux_notify` works through the remote relay and lights up the host cmux workspace.
 - `cmux action="remote-status"` returns the host workspace's SSH relay state.
+- `cmux action="diagnose"` reports runtime mode, binary, version, command/RPC capability counts, missing sidebar commands, env hints, and remote relay state.
 - `cmux action="identify"` falls back to `rpc system.identify` when the remote wrapper lacks the local `identify` command.
 - `cmux_status action="sidebar-state"` falls back to the sidebar snapshot RPC.
+- Lifecycle cleanup uses capability-gated helpers and `notification.clear` RPC fallback where available, instead of blindly shelling unsupported commands.
 
 Current stable cmux remote wrappers may not expose `set-status`, `set-progress`, or `log`. In that case lifecycle sidebar writes no-op cleanly, and `cmux_status` returns a clear unsupported-mode error instead of pretending it worked.
 

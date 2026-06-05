@@ -53,6 +53,8 @@ cmux action="tree"
 cmux action="tree" args=["--all"]
 cmux action="identify"
 cmux action="remote-status"
+cmux action="diagnose"
+cmux action="capabilities"
 cmux action="list-workspaces"
 cmux action="current-workspace"
 cmux action="list-panes"
@@ -103,7 +105,7 @@ cmux action="close-workspace" args=["--workspace", "workspace:4"]
 
 ### `cmux_status` — Sidebar Status, Progress, and Logs
 
-Control the cmux sidebar for the current workspace. In `cmux ssh` remote relay mode, current stable cmux may support notifications and remote status but not sidebar mutation commands (`set-status`, `set-progress`, `log`). If unsupported, the tool returns a clear error and lifecycle status writes no-op instead of failing the Pi session.
+Control the cmux sidebar for the current workspace. In `cmux ssh` remote relay mode, current stable cmux may support notifications and remote status but not sidebar mutation commands (`set-status`, `set-progress`, `log`). If unsupported, the tool returns a clear error and lifecycle status writes no-op instead of failing the Pi session. Use `cmux action="diagnose"` first when local/remote behavior looks odd.
 
 #### Status entries
 

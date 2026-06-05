@@ -35,7 +35,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { execSync, execFileSync, spawn } from "node:child_process";
+import { execSync, spawn, spawnSync } from "node:child_process";
 import { accessSync, constants, existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
 
@@ -147,6 +147,8 @@ interface CmuxRuntime {
   binary: string;
   mode: CmuxRuntimeMode;
   commands: Set<string>;
+  rpcMethods: Set<string>;
+  version: string | null;
   hasSidebarCli: boolean;
 }
 
@@ -209,13 +211,38 @@ function parseCommands(helpText: string): Set<string> {
   return commands;
 }
 
+function parseCapabilities(raw: string): Set<string> {
+  try {
+    const payload = JSON.parse(raw);
+    const methods = Array.isArray(payload?.methods) ? payload.methods : [];
+    return new Set(methods.filter((method: unknown): method is string => typeof method === "string"));
+  } catch {
+    return new Set();
+  }
+}
+
+function detectCmuxVersion(binary: string): string | null {
+  for (const args of [["version"], ["--version"]]) {
+    try {
+      const version = runCmuxBinary(binary, args, 2000);
+      if (version) return version;
+    } catch { /* try next */ }
+  }
+  return null;
+}
+
 function runCmuxBinary(binary: string, args: string[], timeout = 5000): string {
-  return execFileSync(binary, args, {
+  const result = spawnSync(binary, args, {
     encoding: "utf-8",
     timeout,
     env: process.env,
     stdio: ["ignore", "pipe", "pipe"],
-  }).trim();
+  });
+  if (result.error) throw result.error;
+  if (result.status && result.status !== 0) {
+    throw new Error((result.stderr || result.stdout || `exit ${result.status}`).trim());
+  }
+  return (result.stdout || result.stderr || "").trim();
 }
 
 function detectRemoteRelay(binary: string): boolean {
@@ -249,11 +276,18 @@ function detectCmuxRuntime(): CmuxRuntime | null {
     help = runCmuxBinary(binary, ["--help"], 3000);
   } catch { /* best-effort */ }
 
+  let capabilities = "";
+  try {
+    capabilities = runCmuxBinary(binary, ["capabilities"], 3000);
+  } catch { /* best-effort */ }
+
   const commands = parseCommands(help);
   return {
     binary,
     mode: remote ? "remote-ssh" : "local",
     commands,
+    rpcMethods: parseCapabilities(capabilities),
+    version: detectCmuxVersion(binary),
     hasSidebarCli: commands.has("set-status") && commands.has("clear-status"),
   };
 }
@@ -265,6 +299,10 @@ function cmuxRuntime(): CmuxRuntime | null {
 
 function cmuxSupports(command: string): boolean {
   return cmuxRuntime()?.commands.has(command) === true;
+}
+
+function cmuxSupportsRpc(method: string): boolean {
+  return cmuxRuntime()?.rpcMethods.has(method) === true;
 }
 
 function cmux(...args: string[]): string {
@@ -291,6 +329,15 @@ function cmuxRpc(method: string, params: Record<string, unknown> = {}): string {
   return cmux("rpc", method, JSON.stringify(params));
 }
 
+function cmuxRpcSafe(method: string, params: Record<string, unknown> = {}): string | null {
+  if (!cmuxSupportsRpc(method)) return null;
+  try {
+    return cmuxRpc(method, params);
+  } catch {
+    return null;
+  }
+}
+
 function cmuxCommand(action: string, args: string[] = []): string {
   if (action === "remote-status") return cmuxRpc("workspace.remote.status");
   if (action === "identify" && !cmuxSupports("identify")) return cmuxRpc("system.identify");
@@ -308,6 +355,61 @@ function hasSidebarCli(): boolean {
 
 function cmuxMode(): CmuxRuntimeMode | "none" {
   return cmuxRuntime()?.mode || "none";
+}
+
+function clearNotifications(): void {
+  if (cmuxSupports("clear-notifications")) {
+    cmuxSafe("clear-notifications");
+    return;
+  }
+  cmuxRpcSafe("notification.clear");
+}
+
+function clearLog(): void {
+  if (cmuxSupports("clear-log")) cmuxSafe("clear-log");
+}
+
+function clearProgress(): void {
+  if (cmuxSupports("clear-progress")) cmuxSafe("clear-progress");
+}
+
+function workspaceAction(action: string): void {
+  if (cmuxSupports("workspace-action")) cmuxSafe("workspace-action", "--action", action);
+}
+
+function claudeHook(event: string): void {
+  if (cmuxSupports("claude-hook")) cmuxSafe("claude-hook", event);
+}
+
+function parseJsonSafe(raw: string | null): unknown {
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return raw;
+  }
+}
+
+function runtimeDiagnostics(): Record<string, unknown> {
+  const runtime = cmuxRuntime();
+  const remoteStatus = runtime?.mode === "remote-ssh" ? cmuxRpcSafe("workspace.remote.status") : null;
+  return {
+    available: Boolean(runtime),
+    mode: runtime?.mode || "none",
+    binary: runtime?.binary || null,
+    version: runtime?.version || null,
+    hasSidebarCli: runtime?.hasSidebarCli || false,
+    commandCount: runtime?.commands.size || 0,
+    rpcMethodCount: runtime?.rpcMethods.size || 0,
+    missingSidebarCommands: ["set-status", "clear-status", "set-progress", "clear-progress", "log", "clear-log", "sidebar-state"].filter((command) => !cmuxSupports(command)),
+    env: {
+      hasCmuxWorkspace: Boolean(process.env.CMUX_WORKSPACE_ID),
+      hasCmuxSurface: Boolean(process.env.CMUX_SURFACE_ID),
+      hasCmuxSocket: Boolean(process.env.CMUX_SOCKET_PATH),
+      hasSshConnection: Boolean(process.env.SSH_CONNECTION || process.env.SSH_CLIENT),
+    },
+    remoteStatus: parseJsonSafe(remoteStatus),
+  };
 }
 
 // ── peon-ping detection ────────────────────────────────
@@ -355,7 +457,7 @@ let _currentPaneStatus: { value: string; icon: string; color: string } = STATUS_
 
 function setStatus(status: { value: string; icon: string; color: string }): void {
   _currentPaneStatus = status;
-  cmuxSafe("clear-status", STATUS_KEY);
+  if (hasSidebarCli()) cmuxSafe("clear-status", STATUS_KEY);
   clearBuiltinStatus();
   schedulePaneStackRefresh();
 }
@@ -610,7 +712,7 @@ function updatePiMetadata(pi: ExtensionAPI, ctx: any): void {
 /** Check if this pi surface is currently focused by the user. */
 function isFocused(): boolean {
   try {
-    const raw = cmux("identify");
+    const raw = cmuxCommand("identify");
     const info = JSON.parse(raw);
     return info.caller?.surface_ref === info.focused?.surface_ref;
   } catch {
@@ -890,8 +992,8 @@ export default function cmuxExtension(pi: ExtensionAPI) {
     }
     _hasNamedSession = ENABLE_SESSION_NAMING && Boolean(existingName);
     // Clear stale state from previous sessions
-    cmuxSafe("clear-notifications");
-    cmuxSafe("clear-log");
+    clearNotifications();
+    clearLog();
     setStatus(STATUS_IDLE);
     startPaneStackReporter();
     updatePiMetadata(pi, ctx);
@@ -909,9 +1011,9 @@ export default function cmuxExtension(pi: ExtensionAPI) {
   // ── Lifecycle: user types → instantly clear attention state ──
   pi.on("input", async () => {
     setStatus(STATUS_IDLE);
-    cmuxSafe("clear-notifications");
-    cmuxSafe("workspace-action", "--action", "mark-read");
-    cmuxSafe("claude-hook", "prompt-submit");
+    clearNotifications();
+    workspaceAction("mark-read");
+    claudeHook("prompt-submit");
     schedulePaneStackRefresh();
   });
 
@@ -939,7 +1041,7 @@ export default function cmuxExtension(pi: ExtensionAPI) {
 
   // ── Lifecycle: agent running — clear attention state, start heartbeat ──
   pi.on("agent_start", async (_event, ctx) => {
-    cmuxSafe("clear-notifications");
+    clearNotifications();
     _waitingForHuman = false;
     setStatus(STATUS_RUNNING);
     updatePiMetadata(pi, ctx);
@@ -976,7 +1078,7 @@ export default function cmuxExtension(pi: ExtensionAPI) {
       // Human-blocking tool: flip to "Needs input" and notify
       _waitingForHuman = true;
       setStatus(STATUS_NEEDS_INPUT);
-      cmuxSafe("workspace-action", "--action", "mark-unread");
+      workspaceAction("mark-unread");
       if (IS_WORKER && WORKER_AGENT_ID) writeFleetStatus(WORKER_AGENT_ID, "needs-input");
       if (!isFocused()) {
         const sessionName = pi.getSessionName();
@@ -1032,7 +1134,7 @@ export default function cmuxExtension(pi: ExtensionAPI) {
     // Mark workspace tab as unread (visual indicator) + notify if not focused.
     // Workers skip notifications: the orchestrator's completion detection handles fleet alerts.
     if (!isFocused()) {
-      cmuxSafe("workspace-action", "--action", "mark-unread");
+      workspaceAction("mark-unread");
       if (!IS_WORKER) {
         const sessionName = pi.getSessionName();
         notify("pi", sessionName ? `${sessionName} — waiting for input` : "Waiting for input");
@@ -1061,8 +1163,8 @@ export default function cmuxExtension(pi: ExtensionAPI) {
     cmuxSafe("clear-status", SESSION_NAME_KEY);
     cmuxSafe("clear-status", PI_MODEL_KEY);
     cmuxSafe("clear-status", PI_USAGE_KEY);
-    cmuxSafe("clear-notifications");
-    cmuxSafe("clear-progress");
+    clearNotifications();
+    clearProgress();
     // Worker IPC: clean up status file
     if (IS_WORKER && WORKER_AGENT_ID) clearFleetStatus(WORKER_AGENT_ID);
   });
@@ -1092,7 +1194,7 @@ export default function cmuxExtension(pi: ExtensionAPI) {
     label: "cmux",
     description: [
       "Control the cmux terminal multiplexer. Actions:",
-      "• tree / identify / remote-status — show topology and caller/SSH relay refs",
+      "• tree / identify / remote-status / diagnose / capabilities — show topology, runtime, and SSH relay refs",
       "• list-windows / list-workspaces / list-panes / list-pane-surfaces — inspect topology",
       "• read-screen — read terminal content from any surface (--surface, --lines, --scrollback)",
       "• send / send-key — send text or keys to a surface",
@@ -1108,6 +1210,8 @@ export default function cmuxExtension(pi: ExtensionAPI) {
         Type.Literal("tree"),
         Type.Literal("identify"),
         Type.Literal("remote-status"),
+        Type.Literal("diagnose"),
+        Type.Literal("capabilities"),
         Type.Literal("list-windows"),
         Type.Literal("current-window"),
         Type.Literal("list-workspaces"),
@@ -1122,6 +1226,7 @@ export default function cmuxExtension(pi: ExtensionAPI) {
         Type.Literal("new-surface"),
         Type.Literal("focus-window"),
         Type.Literal("select-workspace"),
+        Type.Literal("rename-workspace"),
         Type.Literal("focus-pane"),
         Type.Literal("focus-panel"),
         Type.Literal("close-window"),
@@ -1146,7 +1251,7 @@ export default function cmuxExtension(pi: ExtensionAPI) {
 
       // Allowlist of safe commands
       const allowed = new Set([
-        "tree", "identify", "remote-status",
+        "tree", "identify", "remote-status", "diagnose", "capabilities",
         "list-windows", "current-window", "list-workspaces", "current-workspace",
         "read-screen", "send", "send-key",
         "new-window", "new-workspace", "new-split", "new-pane", "new-surface",
@@ -1166,7 +1271,9 @@ export default function cmuxExtension(pi: ExtensionAPI) {
       }
 
       try {
-        const result = cmuxCommand(action, args);
+        const result = action === "diagnose"
+          ? JSON.stringify(runtimeDiagnostics(), null, 2)
+          : cmuxCommand(action, args);
         schedulePaneStackRefresh();
         return { content: [{ type: "text", text: result || "OK" }] };
       } catch (e: any) {
