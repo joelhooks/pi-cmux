@@ -27,14 +27,16 @@
  *   but disables subprocess-spawning features (session naming,
  *   turn summary helpers). Use for agents spawned by an orchestrator.
  *
- * Requires: cmux CLI in PATH and CMUX_SOCKET_PATH env var.
+ * Requires either:
+ *   - local cmux terminal env (CMUX_WORKSPACE_ID / CMUX_SOCKET_PATH), or
+ *   - cmux ssh remote relay wrapper at ~/.cmux/bin/cmux.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { execSync, execFileSync, spawn } from "node:child_process";
-import { writeFileSync, unlinkSync, mkdirSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
 
 // ── Config ─────────────────────────────────────────────
@@ -139,6 +141,17 @@ function clearFleetStatus(agentId: string): void {
 
 // ── cmux CLI wrapper ───────────────────────────────────
 
+type CmuxRuntimeMode = "local" | "remote-ssh";
+
+interface CmuxRuntime {
+  binary: string;
+  mode: CmuxRuntimeMode;
+  commands: Set<string>;
+  hasSidebarCli: boolean;
+}
+
+let _cmuxRuntime: CmuxRuntime | null = null;
+
 function isRunningInsideCmux(): boolean {
   return Boolean(
     process.env.CMUX_WORKSPACE_ID
@@ -148,13 +161,118 @@ function isRunningInsideCmux(): boolean {
   );
 }
 
-function cmux(...args: string[]): string {
+function isExecutable(filePath: string): boolean {
   try {
-    return execFileSync("cmux", args, {
+    accessSync(filePath, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function commandPath(command: string): string | null {
+  try {
+    const found = execSync(`command -v ${command}`, {
       encoding: "utf-8",
-      timeout: 5000,
+      timeout: 2000,
       env: process.env,
     }).trim();
+    return found || null;
+  } catch {
+    return null;
+  }
+}
+
+function resolveCmuxBinary(): string | null {
+  const explicit = process.env.PI_CMUX_BIN;
+  if (explicit && isExecutable(explicit)) return explicit;
+
+  const fromPath = commandPath("cmux");
+  if (fromPath) return fromPath;
+
+  // cmux ssh installs a tiny remote wrapper here. Pi tool subprocesses often do
+  // not inherit the shell PATH/CMUX_* env, so discover it explicitly.
+  const home = process.env.HOME || "";
+  const remoteWrapper = home ? path.join(home, ".cmux", "bin", "cmux") : "";
+  const socketAddr = home ? path.join(home, ".cmux", "socket_addr") : "";
+  if (remoteWrapper && isExecutable(remoteWrapper) && existsSync(socketAddr)) return remoteWrapper;
+
+  return null;
+}
+
+function parseCommands(helpText: string): Set<string> {
+  const commands = new Set<string>();
+  for (const line of helpText.split("\n")) {
+    const match = line.match(/^\s{2,}([a-z][a-z0-9-]*)\b/);
+    if (match) commands.add(match[1]);
+  }
+  return commands;
+}
+
+function runCmuxBinary(binary: string, args: string[], timeout = 5000): string {
+  return execFileSync(binary, args, {
+    encoding: "utf-8",
+    timeout,
+    env: process.env,
+    stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
+}
+
+function detectRemoteRelay(binary: string): boolean {
+  if (isRunningInsideCmux()) return false;
+  if (!process.env.SSH_CONNECTION && !process.env.SSH_CLIENT) return false;
+  try {
+    const raw = runCmuxBinary(binary, ["rpc", "workspace.remote.status", "{}"], 5000);
+    const payload = JSON.parse(raw);
+    return payload?.remote?.enabled === true || payload?.remote?.state === "connected";
+  } catch {
+    return false;
+  }
+}
+
+function detectCmuxRuntime(): CmuxRuntime | null {
+  const binary = resolveCmuxBinary();
+  if (!binary) return null;
+
+  try {
+    runCmuxBinary(binary, ["ping"], 3000);
+  } catch {
+    return null;
+  }
+
+  const local = isRunningInsideCmux();
+  const remote = detectRemoteRelay(binary);
+  if (!local && !remote) return null;
+
+  let help = "";
+  try {
+    help = runCmuxBinary(binary, ["--help"], 3000);
+  } catch { /* best-effort */ }
+
+  const commands = parseCommands(help);
+  return {
+    binary,
+    mode: remote ? "remote-ssh" : "local",
+    commands,
+    hasSidebarCli: commands.has("set-status") && commands.has("clear-status"),
+  };
+}
+
+function cmuxRuntime(): CmuxRuntime | null {
+  if (!_cmuxRuntime) _cmuxRuntime = detectCmuxRuntime();
+  return _cmuxRuntime;
+}
+
+function cmuxSupports(command: string): boolean {
+  return cmuxRuntime()?.commands.has(command) === true;
+}
+
+function cmux(...args: string[]): string {
+  const runtime = cmuxRuntime();
+  if (!runtime) throw new Error("cmux unavailable");
+
+  try {
+    return runCmuxBinary(runtime.binary, args);
   } catch (e: any) {
     const msg = e.stderr?.toString().trim() || e.message;
     throw new Error(`cmux ${args[0]} failed: ${msg}`);
@@ -169,13 +287,27 @@ function cmuxSafe(...args: string[]): string | null {
   }
 }
 
+function cmuxRpc(method: string, params: Record<string, unknown> = {}): string {
+  return cmux("rpc", method, JSON.stringify(params));
+}
+
+function cmuxCommand(action: string, args: string[] = []): string {
+  if (action === "remote-status") return cmuxRpc("workspace.remote.status");
+  if (action === "identify" && !cmuxSupports("identify")) return cmuxRpc("system.identify");
+  if (action === "sidebar-state" && !cmuxSupports("sidebar-state")) return cmuxRpc("extension.sidebar.snapshot");
+  return cmux(action, ...args);
+}
+
 function hasCmux(): boolean {
-  try {
-    execSync("which cmux", { encoding: "utf-8", timeout: 2000 });
-    return true;
-  } catch {
-    return false;
-  }
+  return cmuxRuntime() !== null;
+}
+
+function hasSidebarCli(): boolean {
+  return cmuxRuntime()?.hasSidebarCli === true;
+}
+
+function cmuxMode(): CmuxRuntimeMode | "none" {
+  return cmuxRuntime()?.mode || "none";
 }
 
 // ── peon-ping detection ────────────────────────────────
@@ -229,16 +361,19 @@ function setStatus(status: { value: string; icon: string; color: string }): void
 }
 
 function clearStatus(): void {
+  if (!hasSidebarCli()) return;
   cmuxSafe("clear-status", STATUS_KEY);
   // cmux has a built-in claude_code status key that conflicts with ours — always clear it
   cmuxSafe("clear-status", "claude_code");
 }
 
 function clearBuiltinStatus(): void {
+  if (!hasSidebarCli()) return;
   cmuxSafe("clear-status", "claude_code");
 }
 
 function setSidebarEntry(entry: SidebarStatusEntry): void {
+  if (!hasSidebarCli()) return;
   const args = ["set-status", entry.key, entry.value];
   if (entry.icon) args.push("--icon", entry.icon);
   if (entry.color) args.push("--color", entry.color);
@@ -273,7 +408,7 @@ function shortenLabel(text: string, max = 52): string {
 
 function currentCmuxInfo(): CmuxIdentifyPayload | null {
   try {
-    return JSON.parse(cmux("identify")) as CmuxIdentifyPayload;
+    return JSON.parse(cmuxCommand("identify")) as CmuxIdentifyPayload;
   } catch {
     return null;
   }
@@ -337,6 +472,7 @@ let _paneStackKeys: string[] = [];
 let _paneStackSignature: string | null = null;
 
 function renderPaneStack(): void {
+  if (!hasSidebarCli()) return;
   cmuxSafe("clear-status", STATUS_KEY);
   clearBuiltinStatus();
 
@@ -381,8 +517,10 @@ function stopPaneStackReporter(): void {
     clearTimeout(_paneStackRefreshTimer);
     _paneStackRefreshTimer = null;
   }
-  for (const key of (_paneStackKeys.length ? _paneStackKeys : paneStackKeys())) {
-    cmuxSafe("clear-status", key);
+  if (hasSidebarCli()) {
+    for (const key of (_paneStackKeys.length ? _paneStackKeys : paneStackKeys())) {
+      cmuxSafe("clear-status", key);
+    }
   }
   _paneStackKeys = [];
   _paneStackSignature = null;
@@ -486,7 +624,12 @@ function notify(title: string, body?: string, subtitle?: string): void {
   const args = ["notify", "--title", title];
   if (subtitle) args.push("--subtitle", subtitle);
   if (body) args.push("--body", body);
-  cmuxSafe(...args);
+  if (cmuxSafe(...args) !== null) return;
+
+  // cmux ssh remote wrappers on current stable support notify, but not --subtitle.
+  const fallbackArgs = ["notify", "--title", subtitle ? `${title} — ${subtitle}` : title];
+  if (body) fallbackArgs.push("--body", body);
+  cmuxSafe(...fallbackArgs);
 }
 
 // ── Session naming ─────────────────────────────────────
@@ -731,8 +874,7 @@ function stopHeartbeat(): void {
 
 export default function cmuxExtension(pi: ExtensionAPI) {
   if (process.env[CMUX_CHILD_ENV] === "1") return;
-  if (!hasCmux()) return;
-  if (!isRunningInsideCmux()) return; // zellij/plain shells/SSH should no-op cleanly
+  if (!hasCmux()) return; // plain shells without cmux local env or cmux ssh relay no-op cleanly
 
   // Detect peon-ping on load
   peonPath = detectPeonPing();
@@ -950,7 +1092,7 @@ export default function cmuxExtension(pi: ExtensionAPI) {
     label: "cmux",
     description: [
       "Control the cmux terminal multiplexer. Actions:",
-      "• tree / identify — show topology and caller workspace/pane/surface refs",
+      "• tree / identify / remote-status — show topology and caller/SSH relay refs",
       "• list-windows / list-workspaces / list-panes / list-pane-surfaces — inspect topology",
       "• read-screen — read terminal content from any surface (--surface, --lines, --scrollback)",
       "• send / send-key — send text or keys to a surface",
@@ -965,6 +1107,7 @@ export default function cmuxExtension(pi: ExtensionAPI) {
       action: Type.Union([
         Type.Literal("tree"),
         Type.Literal("identify"),
+        Type.Literal("remote-status"),
         Type.Literal("list-windows"),
         Type.Literal("current-window"),
         Type.Literal("list-workspaces"),
@@ -1003,7 +1146,7 @@ export default function cmuxExtension(pi: ExtensionAPI) {
 
       // Allowlist of safe commands
       const allowed = new Set([
-        "tree", "identify",
+        "tree", "identify", "remote-status",
         "list-windows", "current-window", "list-workspaces", "current-workspace",
         "read-screen", "send", "send-key",
         "new-window", "new-workspace", "new-split", "new-pane", "new-surface",
@@ -1023,7 +1166,7 @@ export default function cmuxExtension(pi: ExtensionAPI) {
       }
 
       try {
-        const result = cmux(action, ...args);
+        const result = cmuxCommand(action, args);
         schedulePaneStackRefresh();
         return { content: [{ type: "text", text: result || "OK" }] };
       } catch (e: any) {
@@ -1093,6 +1236,16 @@ export default function cmuxExtension(pi: ExtensionAPI) {
 
     async execute(_id, params): Promise<any> {
       try {
+        if (!hasSidebarCli() && params.action !== "sidebar-state") {
+          return {
+            content: [{
+              type: "text",
+              text: `cmux sidebar CLI is unavailable in ${cmuxMode()} mode. Current cmux ssh remote relay supports notifications and remote-status, but not set-status/progress/log yet.`,
+            }],
+            isError: true,
+          };
+        }
+
         switch (params.action) {
           case "set-status": {
             if (!params.key || !params.value)
@@ -1134,7 +1287,7 @@ export default function cmuxExtension(pi: ExtensionAPI) {
             cmux("clear-log");
             return { content: [{ type: "text", text: "Log cleared" }] };
           case "sidebar-state": {
-            const result = cmux("sidebar-state");
+            const result = cmuxCommand("sidebar-state");
             return { content: [{ type: "text", text: result }] };
           }
         }

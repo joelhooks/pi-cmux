@@ -38,7 +38,7 @@ Use the discovered refs, not guessed refs. Do not type rename commands into the 
 
 **Surfaces** — a surface is a single terminal or browser tab inside a pane. Each pane can have multiple surfaces (shown as tabs). Each workspace has one or more panes (splits).
 
-**Environment** — cmux auto-sets `CMUX_WORKSPACE_ID`, `CMUX_SURFACE_ID`, and `CMUX_SOCKET_PATH` in every terminal it manages. Commands default to the caller's workspace/surface when flags are omitted.
+**Environment** — cmux auto-sets `CMUX_WORKSPACE_ID`, `CMUX_SURFACE_ID`, and `CMUX_SOCKET_PATH` in local terminal surfaces. In `cmux ssh` remote sessions, Pi subprocesses may not inherit those variables; the extension discovers `~/.cmux/bin/cmux` and the relay socket automatically. Commands default to the caller's workspace/surface when flags are omitted where cmux exposes caller context.
 
 ## Tools
 
@@ -52,6 +52,7 @@ The main tool for multiplexer operations. Takes an `action` and optional `args` 
 cmux action="tree"
 cmux action="tree" args=["--all"]
 cmux action="identify"
+cmux action="remote-status"
 cmux action="list-workspaces"
 cmux action="current-workspace"
 cmux action="list-panes"
@@ -102,7 +103,7 @@ cmux action="close-workspace" args=["--workspace", "workspace:4"]
 
 ### `cmux_status` — Sidebar Status, Progress, and Logs
 
-Control the cmux sidebar for the current workspace.
+Control the cmux sidebar for the current workspace. In `cmux ssh` remote relay mode, current stable cmux may support notifications and remote status but not sidebar mutation commands (`set-status`, `set-progress`, `log`). If unsupported, the tool returns a clear error and lifecycle status writes no-op instead of failing the Pi session.
 
 #### Status entries
 
