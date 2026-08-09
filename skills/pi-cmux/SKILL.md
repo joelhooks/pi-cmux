@@ -1,6 +1,7 @@
 ---
 name: pi-cmux
 description: "Control cmux terminal multiplexer from pi — read other terminal screens, send commands to other workspaces, manage panes/splits, set sidebar status/progress, send notifications, and open browser surfaces. Use when asked to: check what's running in another terminal, send a command to another pane, split the workspace, show progress in the sidebar, notify the user, open a URL in a browser pane, orchestrate multi-workspace workflows, or interact with cmux in any way. Triggers on: 'cmux', 'other terminal', 'other workspace', 'read screen', 'send command to', 'split pane', 'sidebar status', 'progress bar', 'notify', 'browser pane', 'terminal multiplexer'."
+disable-model-invocation: true
 ---
 
 # cmux Integration for Pi
