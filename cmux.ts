@@ -174,10 +174,14 @@ function isExecutable(filePath: string): boolean {
 
 function commandPath(command: string): string | null {
   try {
-    const found = execSync(`command -v ${command}`, {
+    // "command -v" is a POSIX shell builtin and fails on Windows cmd.exe,
+    // which node's execSync falls back to. Use "where" there instead.
+    const lookup = process.platform === "win32" ? `where ${command}` : `command -v ${command}`;
+    const found = execSync(lookup, {
       encoding: "utf-8",
       timeout: 2000,
       env: process.env,
+      stdio: ["ignore", "pipe", "ignore"],
     }).trim();
     return found || null;
   } catch {
